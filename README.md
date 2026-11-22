@@ -53,8 +53,7 @@ production values are operator configuration and are not published.
   onboarding, billing integration points).
 - `auth-ui/` — the browser auth/account UI and the agent guide
   (`auth-ui/public/ai-agent-guide.txt`).
-- `docs/` — the auth contract and the prayer-input specification.
-  The MCP connection guide for agents is the agent guide in
+- The MCP connection guide for agents is the agent guide in
   `auth-ui/public/ai-agent-guide.txt`.
 - `tests/` — the subset of the test suite that runs against the
   open shell (stub core, synthetic parameters).
@@ -64,7 +63,7 @@ production values are operator configuration and are not published.
 ```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -e .
-python -m pytest tests/        # shell test subset
+PYTHONPATH=src:tests python -m unittest discover -s tests -p "test_*.py"
 cd auth-ui && npm ci && npm test
 ```
 
