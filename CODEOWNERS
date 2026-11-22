@@ -1,0 +1,6 @@
+# Every path requires a review from the repository owner.
+# Exceptions are removed path-by-path only with an explicit,
+# recorded approval; the default is full coverage so that no
+# sensitive area (auth, billing, workflows) can slip through
+# unreviewed.
+* @asahi-inoue-jp-shaman-ai-engineer

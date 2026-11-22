@@ -1,0 +1,14 @@
+{
+  "name": "aiqs-si-auth",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "2.118.0",
+    "vite": "8.3.5"
+  }
+}

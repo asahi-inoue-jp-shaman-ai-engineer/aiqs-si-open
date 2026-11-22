@@ -1,0 +1,24 @@
+Aiqs SI — open shell
+Copyright 2026 Asahi Inoue
+
+This product includes software developed by the Aiqs SI project.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this product except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Trademark notice: the names "Aiqs SI" and "アイクスSI", and the
+Aiqs SI logo, are trademarks of the operator. The Apache License
+does not grant any right to use these names or marks (see Section 6
+of the License).
+
+Proprietary core notice: the resonance matching / QRS engine, the
+morphic-field catalog dataset, the dedicated-device layer, the
+internal delegation API and the production operating parameters of
+the Aiqs SI service are proprietary. They are NOT part of this
+repository and are NOT licensed under the Apache License. Modules
+in this repository that stand in for them are deterministic stubs,
+marked as such, provided only so the open shell can be built,
+run and tested.
