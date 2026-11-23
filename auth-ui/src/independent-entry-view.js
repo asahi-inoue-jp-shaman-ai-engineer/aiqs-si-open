@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { createMemoryClient, createIndependentEntry } from './independent-entry.js';
+import { createMemoryClient, createIndependentEntry, createBrowserPendingStore } from './independent-entry.js';
 import { parseEntryRuntimeConfig } from './entry-runtime-config.js';
 
 // Loaded only by the opt-in synthetic Keycloak template, never the public app.
@@ -16,7 +16,10 @@ if (root) {
   }
   function render() {
     const state = entry?.state;
-    element('si-login-form').hidden = state !== 'ready';
+    // A restored 'verification' state also offers login (Astra
+    // round-1 F10): the email may already be confirmed, and signing
+    // in is what completes the pending registration.
+    element('si-login-form').hidden = !(state === 'ready' || state === 'verification');
     element('si-signup-form').hidden = state !== 'ready';
     element('si-verify-form').hidden = state !== 'verification';
     element('si-retry-complete').hidden = state !== 'completion';
@@ -48,6 +51,7 @@ if (root) {
         nativeForm.method.toLowerCase() !== 'post') throw new Error();
     client = createMemoryClient(createClient, sdkConfig);
     entry = createIndependentEntry({ auth: client.auth, origin: location.origin,
+      pendingStore: createBrowserPendingStore(),
       fetch: (url, options) => fetch(url, { ...options, signal: AbortSignal.timeout(10000) }),
       handoff: async token => {
         nativeForm.elements.namedItem('upstream_token').value = token;

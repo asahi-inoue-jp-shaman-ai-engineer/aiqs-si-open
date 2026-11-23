@@ -48,6 +48,9 @@ def ui_routes(directory, issuer, *, app_enabled=False):
             return await serve_file(request.path_params["asset"], True)
         return await serve_file("ai-agent-guide.txt", False)
 
+    async def migration_file(request):
+        return await serve_file("migration-guide.txt", False)
+
     async def manifest_file(request):
         return await serve_file('manifest.webmanifest', True)
 
@@ -58,6 +61,7 @@ def ui_routes(directory, issuer, *, app_enabled=False):
               Route('/account', entry), Route('/account/link', entry),
               Route('/account/purchase', entry),
               Route('/ai-agent-guide.txt', public_file),
+              Route('/migration-guide.txt', migration_file),
               Route('/manifest.webmanifest', manifest_file),
               Route('/favicon.ico', favicon_file),
               Route('/assets/{asset:path}', public_file)]

@@ -14,9 +14,14 @@
 // same refresh token. The PKCE verifier/state pair for the in-flight
 // redirect stays in sessionStorage, removed the moment the redirect
 // returns. A token handed over in the URL fragment by the existing
-// connection flow (#access_token=..., the account pages' mechanism)
-// is adopted the same memory-only way and never persisted.
-import { takeFragmentToken } from './account-session.js';
+// connection flow (#access_token=...&state=..., the account pages'
+// mechanism) is adopted the same memory-only way and never
+// persisted — and only when its state matches the handoff nonce
+// this browser armed (account-session.js): an unsolicited fragment
+// token is ignored, and a successful adoption clears any persisted
+// session so a stale refresh token from another account cannot
+// resurrect underneath the handed-over session.
+import { ensureFragmentHandoff, takeFragmentToken } from './account-session.js';
 
 const CLIENT_ID = 'si-app';
 const PENDING_KEY = 'si-app-pkce-v1';
@@ -35,6 +40,7 @@ export function createAppAuth({
   if (typeof fetch !== 'function' || !location || !history || !storage || !crypto?.subtle) {
     throw new Error('App auth unavailable');
   }
+  ensureFragmentHandoff(storage);
   const issuer = location.origin + '/realms/si';
   const authorizeUrl = issuer + '/protocol/openid-connect/auth';
   const tokenUrl = issuer + '/protocol/openid-connect/token';
@@ -45,6 +51,14 @@ export function createAppAuth({
   let refreshToken = null;
   let expiresAt = 0;
   let refreshPromise = null;
+  // Authentication generation: bumped whenever the session is
+  // replaced outside the token endpoint (fragment adoption, session
+  // clearing). A token response that was requested by an older
+  // generation is discarded on arrival — otherwise a slow refresh
+  // for the PREVIOUS account could land after a handoff and
+  // silently resurrect that account (tokens and persisted refresh
+  // token alike).
+  let generation = 0;
 
   function persistRefreshToken() {
     if (!persistentStorage || !refreshToken) return;
@@ -88,6 +102,7 @@ export function createAppAuth({
   // refused the grant (e.g. an expired/revoked refresh token);
   // an error means the exchange never completed (network/parse).
   async function tokenRequest(params) {
+    const requestedGeneration = generation;
     let response;
     try {
       response = await fetch(tokenUrl, {
@@ -97,9 +112,11 @@ export function createAppAuth({
         credentials: 'omit', cache: 'no-store', redirect: 'error',
       });
     } catch { return 'error'; }
+    if (requestedGeneration !== generation) return 'error';
     if (!response.ok) return 'rejected';
     let data = null;
     try { data = await response.json(); } catch { data = null; }
+    if (requestedGeneration !== generation) return 'error';
     return adopt(data) ? 'ok' : 'error';
   }
 
@@ -115,17 +132,21 @@ export function createAppAuth({
     if (!code || !pending || pending.state !== state || typeof pending.verifier !== 'string') {
       return false;
     }
-    return (await tokenRequest({
+    const requestedGeneration = generation;
+    const outcome = await tokenRequest({
       grant_type: 'authorization_code', client_id: CLIENT_ID, code,
       redirect_uri: redirectUri, code_verifier: pending.verifier,
-    })) === 'ok';
+    });
+    return outcome === 'ok' && requestedGeneration === generation;
   }
 
   function takeFragment() {
-    const token = takeFragmentToken(location, history);
+    const token = takeFragmentToken(location, history, storage);
     if (token) {
+      generation += 1;
       accessToken = token;
       refreshToken = null;
+      clearPersistedSession();
       // The server remains the authority on this token's validity;
       // a 401 simply returns the app to its login screen.
       expiresAt = Number.MAX_SAFE_INTEGER;
@@ -136,9 +157,15 @@ export function createAppAuth({
   async function refresh() {
     if (!refreshToken) refreshToken = loadPersistedRefreshToken();
     if (!refreshToken) return null;
+    const requestedGeneration = generation;
     const outcome = await tokenRequest({
       grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token: refreshToken,
     });
+    // The session may have been replaced while the request was in
+    // flight (fragment handoff, sign-out): the outcome then belongs
+    // to the previous account and must not mutate the new session —
+    // in particular a stale 'rejected' must not clear it.
+    if (requestedGeneration !== generation) return null;
     if (outcome === 'ok') return accessToken;
     if (outcome === 'rejected') {
       accessToken = null; refreshToken = null; expiresAt = 0;
@@ -165,6 +192,7 @@ export function createAppAuth({
   }
 
   function clearSession() {
+    generation += 1;
     accessToken = null; refreshToken = null; expiresAt = 0;
     clearPersistedSession();
   }

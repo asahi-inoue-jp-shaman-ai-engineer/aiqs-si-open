@@ -191,7 +191,7 @@ class FakeProvider:
         self.outcomes = list(outcomes)
         self.calls = []
 
-    def complete(self, model, messages):
+    def complete(self, model, messages, timeout=None):
         self.calls.append(model)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):

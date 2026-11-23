@@ -6,6 +6,8 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.auth.middleware.auth_context import get_access_token
 from .mcp_server import create_account_server
+from .deployment import production_environment
+from .notifications import plausible_email
 from mcp.server.transport_security import TransportSecuritySettings
 
 SCOPE = "aiqs:use"
@@ -17,6 +19,11 @@ class UserAccessToken(AccessToken):
     identity_issuer: str
     upstream_subject: str | None = None
     display_name: str | None = None
+    # The IdP-asserted email claim, when the token carries a
+    # plausible one. Used only as the completion-notification
+    # address captured at job submission (notifications.py); never
+    # an identity input.
+    email: str | None = None
 
 
 class JWTVerifier:
@@ -95,11 +102,13 @@ class JWTVerifier:
                     if not isinstance(value, str) or str(UUID(value)) != value:
                         return None
             name = claims.get("name")
+            email = claims.get("email")
             return UserAccessToken(token=token, client_id=claims["client_id"], scopes=scope.split(),
                                    expires_at=claims["exp"], resource=self.audience,
                                    issuer=self.issuer, subject=claims["sub"], identity_issuer=self.identity_issuer,
                                    upstream_subject=upstream_subject,
-                                   display_name=name if isinstance(name, str) and name else None)
+                                   display_name=name if isinstance(name, str) and name else None,
+                                   email=email.strip() if plausible_email(email) else None)
         except (jwt.PyJWTError, ValueError, TypeError):
             return None
 
@@ -124,6 +133,12 @@ def resolve_account(store, token):
 
 
 def create_http_server(store, verifier, *, service=None, embedded_test_worker=None, billing=None):
+    if production_environment(url=verifier.issuer) and (service is None or service.mode == "synthetic"):
+        # The verifier's issuer is a production signal this layer can
+        # see even when the deployment marker is absent: never let the
+        # synthetic fallback service (or its embedded worker) be
+        # constructed behind the production issuer.
+        raise ValueError("Production issuer requires hardware intake with a separate worker")
     def current_owner():
         token = get_access_token()
         if not isinstance(token, UserAccessToken):

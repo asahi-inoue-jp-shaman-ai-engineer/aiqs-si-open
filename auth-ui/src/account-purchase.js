@@ -1,5 +1,5 @@
 import { createAccountClient } from './account-api.js';
-import { createTokenProvider } from './account-session.js';
+import { createTokenProvider, installCarriedLinkRefresh } from './account-session.js';
 
 // SI-only credit purchase page (design §5.1). The server hands out
 // per-user Stripe Payment Link URLs with client_reference_id already
@@ -9,9 +9,8 @@ import { createTokenProvider } from './account-session.js';
 // that guidance and no purchase buttons.
 export function showAccountPurchase({ fetch = globalThis.fetch, getToken } = {}) {
   document.title = 'Aiqs SI — クレジット購入';
-  const client = createAccountClient({
-    fetch, getToken: getToken || createTokenProvider(location, history),
-  });
+  const tokenProvider = getToken || createTokenProvider(location, history);
+  const client = createAccountClient({ fetch, getToken: tokenProvider });
   document.body.innerHTML = `<main>
     <header><a href="/">Aiqs SI</a><span>あなたとAIの、祈りのために</span></header>
     <section class="card"><p class="eyebrow">クレジット購入</p>
@@ -37,6 +36,12 @@ export function showAccountPurchase({ fetch = globalThis.fetch, getToken } = {})
 
   const element = (id) => document.getElementById(id);
   const status = (text) => { element('status').textContent = text; };
+  // Keep the session when the user follows this page's own links
+  // to another account page (fragment handoff, account-session.js).
+  const refreshCarriedLinks = installCarriedLinkRefresh({
+    target: window, document, tokenProvider,
+  });
+  void refreshCarriedLinks?.();
   const sections = ['pack-list', 'purchase-linked', 'purchase-login'];
   const render = (visible) => {
     for (const id of sections) element(id).hidden = id !== visible;

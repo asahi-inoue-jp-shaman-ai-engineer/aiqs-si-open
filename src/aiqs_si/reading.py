@@ -19,10 +19,18 @@ of AIQS_SI_OPENROUTER_API_KEY: while either is missing the feature
 does not exist (routes answer 404, the session hides it), exactly
 like the app rollout switch.
 """
+import asyncio
+import json
 import os
 import re
+import threading
+import time
+import unicodedata
 
+import anyio
+import httpcore
 import httpx
+from httpcore._backends.anyio import AnyIOBackend
 
 from.serializers import public_job_view
 
@@ -46,6 +54,11 @@ DEFAULT_FALLBACK_MODEL = "openai/gpt-4o-mini"
 MAX_TOKENS = 2000
 TEMPERATURE = 0.7
 TIMEOUT_SECONDS = 45.0
+# Total budget for one generation across the primary attempt and
+# the single fallback (batch 2b item 5), and the smallest slice of
+# it worth starting an attempt with.
+GENERATION_DEADLINE_SECONDS = 75.0
+MIN_ATTEMPT_SECONDS = 5.0
 TOP_ENTRIES = 10
 FIELD_TRUNCATION = 500
 TEXT_MIN_LENGTH = 300
@@ -157,12 +170,64 @@ def build_reading_messages(entries, intention, self_love_joy):
             {"role": "user", "content": "\n".join(lines)}]
 
 
+# Every body section must carry substantive content of its own
+# (A9, batch 2b item 6): a heading followed by nothing — or by the
+# next heading — is not a reading, however long the rest runs.
+SECTION_MIN_CHARS = 30
+
+
+# Default-ignorable code points outside the Cf/Cc categories
+# (Astra round-2 F9): combining marks and variation selectors
+# that render as nothing on their own — the grapheme joiner,
+# Hangul fillers, Mongolian vowel separators, variation
+# selectors. Category alone does not catch them (U+034F is Mn),
+# so the ranges are named explicitly.
+_IGNORABLE_RANGES = (
+    (0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5),
+    (0x180B, 0x180F), (0x3164, 0x3164), (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0), (0xE0100, 0xE01EF),
+)
+
+
+def _is_visible(char):
+    # Cf/Cc are invisible by category. Cn (unassigned) code points
+    # have no glyph in the Unicode version this runtime ships —
+    # and the Default_Ignorable_Code_Point property explicitly
+    # includes the RESERVED ranges (U+2065, U+FFF0–FFF8, the
+    # unassigned planes' tag ranges), which are exactly Cn
+    # (Astra round-4 F9). The explicit ranges below pin the
+    # assigned ignorables whose category is not Cf/Cc/Cn.
+    if unicodedata.category(char) in ("Cf", "Cc", "Cn"):
+        return False
+    point = ord(char)
+    return not any(start <= point <= end
+                   for start, end in _IGNORABLE_RANGES)
+
+
+def _visible_text(fragment):
+    """The fragment's substantive content: invisible characters
+    (Unicode Cf/Cc format and control characters — zero-width
+    spaces, joiners, bidi marks — plus the default-ignorable
+    combining marks and selectors in _IGNORABLE_RANGES) removed
+    and all whitespace collapsed out. What remains is what a
+    reader would actually see (Astra round-1 F9, round-2 F9)."""
+    visible = "".join(char for char in fragment if _is_visible(char))
+    return "".join(visible.split())
+
+
 def validate_reading_text(text):
     """Pre-settlement output gate (design §6.2; summary-first format
     2026-11-22): the charge settles only for text that opens with a
     【要約】 block of roughly five lines (3-7 accepted), then carries
     all three fixed body headings in order, sits in the length band,
-    and names no machinery."""
+    and names no machinery.
+
+    A9 hardening (batch 2b item 6): each required heading occurs
+    EXACTLY once (a duplicate can hide an empty first section), and
+    every body section carries at least SECTION_MIN_CHARS of
+    non-whitespace content — previously a valid summary plus one
+    full section passed with the remaining sections empty, and a
+    truncated response could satisfy the same shape."""
     if not isinstance(text, str):
         return False
     stripped = text.strip()
@@ -170,16 +235,143 @@ def validate_reading_text(text):
         return False
     if not stripped.startswith(SUMMARY_HEADING):
         return False
-    positions = [stripped.find(heading) for heading in HEADINGS]
-    if any(position < 0 for position in positions):
+    if stripped.count(SUMMARY_HEADING) != 1:
         return False
+    if any(stripped.count(heading) != 1 for heading in HEADINGS):
+        return False
+    positions = [stripped.find(heading) for heading in HEADINGS]
     if positions != sorted(positions):
         return False
     summary_block = stripped[len(SUMMARY_HEADING):positions[0]]
-    summary_lines = [line for line in summary_block.splitlines() if line.strip()]
+    summary_lines = [line for line in summary_block.splitlines()
+                     if _visible_text(line)]
     if not SUMMARY_MIN_LINES <= len(summary_lines) <= SUMMARY_MAX_LINES:
         return False
+    for index, position in enumerate(positions):
+        start = position + len(HEADINGS[index])
+        end = positions[index + 1] if index + 1 < len(positions) else len(stripped)
+        # Substantive VISIBLE content only (Astra round-1 F9):
+        # invisible format/control characters (zero-width spaces,
+        # joiners, bidi marks — Unicode categories Cf/Cc) render as
+        # nothing, so they must not count toward the section
+        # minimum; a section padded with them is an empty section.
+        # (Exact-duplicate bodies across sections are deliberately
+        # NOT rejected: the product's canonical reading shape
+        # repeats a body across sections, so duplication alone is
+        # a quality matter for the prompt, not a settlement gate.)
+        section = _visible_text(stripped[start:end])
+        if len(section) < SECTION_MIN_CHARS:
+            return False
     return not any(pattern.search(stripped) for pattern in _BANNED_PATTERNS)
+
+
+# --- TLS handshake socket reclamation (Astra round-10 F8(b)) ---
+#
+# With the pinned stack (httpx 0.28.1 / httpcore 1.0.9 / anyio
+# 4.16.0), cancelling a request DURING the TLS handshake can leak
+# the raw TCP socket: httpcore's AnyIOStream.start_tls reclaims
+# the socket only under `except Exception`, and asyncio
+# cancellation is a BaseException, so it slips past the cleanup;
+# anyio's TLSStream.wrap likewise awaits the handshake with no
+# cancellation cleanup of its own, and httpcore's connection only
+# exists — and can only be closed by the pool — once _connect()
+# has succeeded. The admission slots are released on cancellation,
+# but the socket is not, and successive failed requests could
+# accumulate descriptors without bound.
+#
+# The mitigation is a network backend whose streams force-close
+# the underlying transport when start_tls fails for ANY reason,
+# cancellation included, before re-raising. The close runs in a
+# shielded cancel scope so it completes even while the owning
+# task is being cancelled. Ordinary failures are unaffected:
+# httpcore's own cleanup already closed the stream then, and a
+# second close is a no-op.
+
+class _TLSReclaimingStream(httpcore.AsyncNetworkStream):
+    """An httpcore network stream that never leaves its raw
+    transport open behind a failed TLS handshake."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def read(self, max_bytes, timeout=None):
+        return await self._inner.read(max_bytes, timeout)
+
+    async def write(self, buffer, timeout=None):
+        await self._inner.write(buffer, timeout)
+
+    async def aclose(self):
+        await self._inner.aclose()
+
+    async def start_tls(self, ssl_context, server_hostname=None,
+                        timeout=None):
+        try:
+            return await self._inner.start_tls(
+                ssl_context, server_hostname=server_hostname,
+                timeout=timeout)
+        except BaseException:
+            try:
+                with anyio.CancelScope(shield=True):
+                    await self._inner.aclose()
+            except Exception:
+                pass
+            raise
+
+    def get_extra_info(self, info):
+        return self._inner.get_extra_info(info)
+
+
+class _TLSReclaimingBackend(httpcore.AsyncNetworkBackend):
+    """The anyio backend with every connected stream wrapped for
+    TLS reclamation. Connection setup itself is unchanged."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def connect_tcp(self, host, port, timeout=None,
+                          local_address=None, socket_options=None):
+        stream = await self._inner.connect_tcp(
+            host, port, timeout=timeout, local_address=local_address,
+            socket_options=socket_options)
+        return _TLSReclaimingStream(stream)
+
+    async def connect_unix_socket(self, path, timeout=None,
+                                  socket_options=None):
+        stream = await self._inner.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options)
+        return _TLSReclaimingStream(stream)
+
+    async def sleep(self, seconds):
+        await self._inner.sleep(seconds)
+
+
+def build_tls_reclaiming_transport(*, ssl_context=None):
+    """The production async transport for provider calls: an
+    httpx transport whose connection pool differs from httpx's
+    default direct-connection pool ONLY in its network backend
+    (the reclamation wrapper above). Limits and protocol settings
+    mirror httpx's defaults; no proxy is configured, exactly like
+    the clients built with trust_env=False today."""
+    if ssl_context is None:
+        ssl_context = httpx.create_ssl_context(
+            verify=True, cert=None, trust_env=False)
+    # httpx's transport defaults, stated explicitly (Astra
+    # round-11 R11-N2): a bare httpx.Limits() leaves the
+    # connection limits unset (None), which is NOT what the
+    # default transport builds.
+    limits = httpx.Limits(max_connections=100,
+                          max_keepalive_connections=20,
+                          keepalive_expiry=5.0)
+    pool = httpcore.AsyncConnectionPool(
+        ssl_context=ssl_context,
+        max_connections=limits.max_connections,
+        max_keepalive_connections=limits.max_keepalive_connections,
+        keepalive_expiry=limits.keepalive_expiry,
+        http1=True, http2=False,
+        network_backend=_TLSReclaimingBackend(AnyIOBackend()))
+    transport = httpx.AsyncHTTPTransport(trust_env=False)
+    transport._pool = pool
+    return transport
 
 
 class OpenRouterClient:
@@ -198,19 +390,139 @@ class OpenRouterClient:
         self._transport = transport
         self._timeout = timeout
 
-    def complete(self, model, messages):
+    def complete(self, model, messages, timeout=None):
         body = {"model": model, "messages": messages,
                 "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE,
                 "usage": {"include": True},
                 "provider": {"data_collection": "deny"}}
+        # Wall-clock budget, enforced DURING the call (Astra
+        # round-1 F8, round-2 F8, round-3 F8): an httpx read
+        # timeout is an INACTIVITY bound — a provider that keeps
+        # dripping chunks can hold a call open indefinitely, and
+        # three gaps let even a streamed read overrun: slow
+        # HEADERS (no chunk ever reaches the loop), compressed
+        # bodies whose decoded output is suppressed until a full
+        # gzip member arrives, and a final stall after the last
+        # chunk. The defenses are layered:
+        #   * the request pins Accept-Encoding: identity, so the
+        #     decoder cannot buffer a compressed body invisibly —
+        #     body chunks reach the deadline check as they arrive;
+        #   * a watchdog timer closes the in-flight response (and
+        #     the client) AT the deadline from another thread, so
+        #     a read blocked in the header phase, between chunks,
+        #     or inside a non-honoring peer's compression is
+        #     interrupted instead of waiting out the inactivity
+        #     timeout; the resulting transport error is then
+        #     reported as the deadline expiry it is.
+        budget = timeout if timeout is not None else self._timeout
+        budget_known = isinstance(budget, (int, float)) \
+            and not isinstance(budget, bool)
+        started = time.monotonic()
+        holder = {}
+        watchdog = None
         try:
             with httpx.Client(trust_env=False, transport=self._transport,
-                              timeout=self._timeout) as client:
-                response = client.post(
-                    OPENROUTER_URL, json=body,
-                    headers={"Authorization": "Bearer " + self._api_key,
-                             "Content-Type": "application/json"})
+                              timeout=budget) as client:
+                if budget_known:
+                    def _expire():
+                        try:
+                            response = holder.get("response")
+                            if response is not None:
+                                response.close()
+                            client.close()
+                        except Exception:
+                            pass
+                    watchdog = threading.Timer(budget, _expire)
+                    watchdog.daemon = True
+                    watchdog.start()
+                with client.stream(
+                        "POST", OPENROUTER_URL, json=body,
+                        headers={"Authorization": "Bearer " + self._api_key,
+                                 "Content-Type": "application/json",
+                                 "Accept-Encoding": "identity"}) as response:
+                    holder["response"] = response
+                    status_code = response.status_code
+                    chunks = []
+                    for chunk in response.iter_bytes():
+                        if budget_known \
+                                and time.monotonic() - started > budget:
+                            raise ReadingProviderError(
+                                "OpenRouter response past deadline")
+                        chunks.append(chunk)
+                    raw = b"".join(chunks)
         except httpx.HTTPError:
+            if budget_known and time.monotonic() - started > budget:
+                raise ReadingProviderError(
+                    "OpenRouter response past deadline") from None
+            raise ReadingProviderError("OpenRouter unreachable") from None
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+        if status_code >= 400:
+            raise ReadingProviderError(
+                f"OpenRouter request failed ({status_code})")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ReadingProviderError("Invalid OpenRouter response") from None
+        return self._parse_completion(data, model)
+
+    async def complete_async(self, model, messages, timeout=None):
+        """The cancellable path (Astra round-4 F8): the whole
+        operation — DNS, connect, TLS, headers, body — runs under
+        asyncio.timeout, whose cancellation actually closes the
+        connection at the deadline in EVERY phase. The synchronous
+        stack cannot promise that (its watchdog close() is a no-op
+        while a connection is still being established), so the
+        app API — an async caller — generates through here. The
+        sync complete() above remains for sync callers, with its
+        layered defenses, and the service-level deadline check
+        still refuses to settle a late answer from either path.
+        Cancellation DURING the TLS handshake additionally
+        force-closes the raw socket through the reclaiming
+        transport (Astra round-10 F8(b)): the pinned httpcore/
+        anyio cleanup does not run for a BaseException
+        cancellation, so without it the released admission slot
+        could leave an open descriptor behind."""
+        body = {"model": model, "messages": messages,
+                "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE,
+                "usage": {"include": True},
+                "provider": {"data_collection": "deny"}}
+        budget = timeout if timeout is not None else self._timeout
+        budget_known = isinstance(budget, (int, float)) \
+            and not isinstance(budget, bool)
+        started = time.monotonic()
+        # The production transport reclaims the raw socket when a
+        # cancellation lands mid-TLS-handshake (Astra round-10
+        # F8(b); see build_tls_reclaiming_transport). An injected
+        # transport (tests) is used exactly as given.
+        transport = self._transport
+        if transport is None:
+            transport = build_tls_reclaiming_transport()
+        try:
+            async with httpx.AsyncClient(
+                    trust_env=False, transport=transport,
+                    timeout=budget) as client:
+                if budget_known:
+                    async with asyncio.timeout(budget):
+                        response = await client.post(
+                            OPENROUTER_URL, json=body,
+                            headers={"Authorization": "Bearer " + self._api_key,
+                                     "Content-Type": "application/json",
+                                     "Accept-Encoding": "identity"})
+                else:
+                    response = await client.post(
+                        OPENROUTER_URL, json=body,
+                        headers={"Authorization": "Bearer " + self._api_key,
+                                 "Content-Type": "application/json",
+                                 "Accept-Encoding": "identity"})
+        except TimeoutError:
+            raise ReadingProviderError(
+                "OpenRouter response past deadline") from None
+        except httpx.HTTPError:
+            if budget_known and time.monotonic() - started > budget:
+                raise ReadingProviderError(
+                    "OpenRouter response past deadline") from None
             raise ReadingProviderError("OpenRouter unreachable") from None
         if response.status_code >= 400:
             raise ReadingProviderError(
@@ -219,9 +531,21 @@ class OpenRouterClient:
             data = response.json()
         except ValueError:
             raise ReadingProviderError("Invalid OpenRouter response") from None
+        return self._parse_completion(data, model)
+
+    @staticmethod
+    def _parse_completion(data, model):
         choices = data.get("choices") if isinstance(data, dict) else None
         if not isinstance(choices, list) or not choices:
             raise ReadingProviderError("Invalid OpenRouter response")
+        # A length-terminated completion is a truncated reading
+        # (A9, batch 2b item 6): its tail sections may be missing
+        # or cut mid-sentence, so it is a provider failure — the
+        # caller's fallback path decides, never settlement.
+        finish_reason = choices[0].get("finish_reason") \
+            if isinstance(choices[0], dict) else None
+        if finish_reason == "length":
+            raise ReadingProviderError("OpenRouter response truncated")
         message = choices[0].get("message") if isinstance(choices[0], dict) else None
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
@@ -262,11 +586,82 @@ class ReadingService:
         payload = scan.get("payload") or {}
         messages = build_reading_messages(entries, payload.get("intention"),
                                           payload.get("self_love_joy"))
+        # One total deadline across both attempts (batch 2b item 5):
+        # each attempt is bounded by the time left, and an attempt
+        # that cannot meaningfully start is not made — a provider
+        # slowdown stays bounded instead of stacking two full
+        # timeouts inside one admission slot.
+        deadline = time.monotonic() + GENERATION_DEADLINE_SECONDS
         outcomes = []
         for model in (self.primary_model, self.fallback_model):
+            remaining = deadline - time.monotonic()
+            if remaining < MIN_ATTEMPT_SECONDS:
+                break
             try:
-                result = self.provider.complete(model, messages)
+                result = self.provider.complete(model, messages,
+                                                timeout=remaining)
             except ReadingProviderError:
+                outcomes.append("unavailable")
+                continue
+            if time.monotonic() > deadline:
+                # A provider that ignored the per-attempt timeout
+                # (Astra round-1 F8): its late answer is not settled
+                # against a deadline the caller already spent.
+                outcomes.append("unavailable")
+                continue
+            if validate_reading_text(result["text"]):
+                return result
+            outcomes.append("invalid")
+        if outcomes and all(outcome == "invalid" for outcome in outcomes):
+            raise ReadingGenerationError("reading_invalid_output")
+        raise ReadingGenerationError("reading_unavailable")
+
+    async def generate_async(self, scan):
+        """generate() for async callers (the app API): when the
+        provider offers a cancellable async completion, the whole
+        attempt runs under its deadline in every network phase
+        (Astra round-4 F8); providers without one (test doubles)
+        run in a worker thread under the same service deadline
+        discipline. Attempt/fallback/validation semantics are
+        identical to generate()."""
+        view = public_job_view(self.store, scan)
+        entries = ((view.get("result") or {}).get("scan") or {}).get("final_entries") or []
+        payload = scan.get("payload") or {}
+        messages = build_reading_messages(entries, payload.get("intention"),
+                                          payload.get("self_love_joy"))
+        deadline = time.monotonic() + GENERATION_DEADLINE_SECONDS
+        outcomes = []
+        complete_async = getattr(self.provider, "complete_async", None)
+        for model in (self.primary_model, self.fallback_model):
+            remaining = deadline - time.monotonic()
+            if remaining < MIN_ATTEMPT_SECONDS:
+                break
+            try:
+                # The attempt is wrapped in wait_for as well (Astra
+                # round-5 F8): a provider that ignores its timeout
+                # argument — async or threaded — cannot hold the
+                # admission slot past the service deadline. (For a
+                # threaded provider the thread itself lingers until
+                # its own transport timeouts fire; the slot is
+                # released, and the late answer is discarded by the
+                # deadline check below.)
+                if complete_async is not None:
+                    result = await asyncio.wait_for(
+                        complete_async(model, messages, timeout=remaining),
+                        timeout=remaining)
+                else:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.provider.complete, model, messages,
+                            timeout=remaining),
+                        timeout=remaining)
+            except ReadingProviderError:
+                outcomes.append("unavailable")
+                continue
+            except TimeoutError:
+                outcomes.append("unavailable")
+                continue
+            if time.monotonic() > deadline:
                 outcomes.append("unavailable")
                 continue
             if validate_reading_text(result["text"]):

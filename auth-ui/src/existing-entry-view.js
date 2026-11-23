@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { createMemoryClient } from './independent-entry.js';
+import { createMemoryClient, createBrowserPendingStore, createRegistrationResumer } from './independent-entry.js';
 import { createExistingEntry } from './existing-entry.js';
 import { parseEntryRuntimeConfig } from './entry-runtime-config.js';
 
@@ -72,7 +72,17 @@ if (root) {
     if (destination.origin !== location.origin || destination.username || destination.password ||
         nativeForm.method.toLowerCase() !== 'post') throw new Error();
     client = createMemoryClient(createClient, sdkConfig);
-    entry = createExistingEntry({ auth: client.auth, handoff: async token => {
+    // Guarded storage acquisition (Astra round-1 F11): when
+    // localStorage is unavailable the entry simply runs without
+    // registration resumption, as it did before A2.
+    const pendingStore = createBrowserPendingStore();
+    entry = createExistingEntry({ auth: client.auth, resumeRegistration: pendingStore
+      ? createRegistrationResumer({
+          origin: location.origin,
+          fetch: (url, options) => fetch(url, { ...options, signal: AbortSignal.timeout(10000) }),
+          pendingStore,
+        })
+      : null, handoff: async token => {
       nativeForm.elements.namedItem('upstream_token').value = token;
       HTMLFormElement.prototype.submit.call(nativeForm);
       clearInputs(); client = null;

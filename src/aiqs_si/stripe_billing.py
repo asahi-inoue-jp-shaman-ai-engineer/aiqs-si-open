@@ -28,6 +28,20 @@ class StripeBilling:
         self.client = client or httpx.Client(timeout=20, follow_redirects=False, trust_env=False)
         with store.transaction() as db:
             db.execute('CREATE TABLE IF NOT EXISTS stripe_orders (id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES accounts(id), request_key TEXT NOT NULL, yen INTEGER NOT NULL, live INTEGER NOT NULL, created_at REAL NOT NULL, UNIQUE(owner,request_key))')
+            # Accepted-offer terms (batch 2b item 4): the credit
+            # amount quoted at checkout is persisted with the order,
+            # so settlement grants what the buyer accepted even if
+            # the pack policy changes before the webhook lands.
+            columns = [row[1] for row in db.execute('PRAGMA table_info(stripe_orders)')]
+            if 'credits' not in columns:
+                db.execute('ALTER TABLE stripe_orders ADD COLUMN credits INTEGER')
+            # Settlement holds (Astra round-1 F5): orders persisted
+            # before accepted terms were recorded carry NULL credits
+            # and must NOT be settled at whatever the current quote
+            # happens to be — the accepted price is unrecoverable
+            # from the order alone, so the webhook parks the order
+            # here for operator reconciliation instead of guessing.
+            db.execute('CREATE TABLE IF NOT EXISTS stripe_settlement_holds (order_id TEXT PRIMARY KEY, owner TEXT NOT NULL, yen INTEGER NOT NULL, session_id TEXT, created_at REAL NOT NULL)')
 
     def checkout(self, owner, request_key, yen):
         quote = purchase_quote(yen)
@@ -41,9 +55,12 @@ class StripeBilling:
                 if time.time() - row['created_at'] > 23 * 3600:
                     raise ValueError('Purchase request expired; use a new request key')
                 order_id = row['id']
+                if row['credits'] is not None:
+                    # The accepted terms are the order's, not today's.
+                    quote = {'yen': yen, 'credits': row['credits'], 'currency': 'JPY'}
             else:
                 order_id = str(uuid.uuid4())
-                db.execute('INSERT INTO stripe_orders VALUES (?,?,?,?,?,?)', (order_id, owner, request_key, yen, int(self.live), time.time()))
+                db.execute('INSERT INTO stripe_orders VALUES (?,?,?,?,?,?,?)', (order_id, owner, request_key, yen, int(self.live), time.time(), quote['credits']))
         form = {'mode': 'payment', 'success_url': self.origin + '/?billing=success',
                 'cancel_url': self.origin + '/?billing=cancel', 'client_reference_id': order_id,
                 'metadata[product]': 'aiqs-si', 'metadata[order_id]': order_id,
@@ -110,8 +127,69 @@ class StripeBilling:
                 or session.get('client_reference_id') != row['id']
                 or not isinstance(session.get('id'), str) or not session['id'].startswith('cs_')):
             raise ValueError('Payment does not match SI order')
-        self.store.record_verified_purchase(row['owner'], 'stripe-order:' + row['id'], row['yen'])
+        # Settle against the order's accepted terms (batch 2b item
+        # 4). Orders persisted before terms were recorded carry
+        # NULL: their accepted price cannot be reconstructed from
+        # the order, so they are HELD for reconciliation (Astra
+        # round-1 F5) — settling them at the current quote would
+        # silently re-price a completed purchase.
+        accepted = row['credits'] if 'credits' in row.keys() else None
+        if accepted is None:
+            # Hold — unless the order is ALREADY settled (Astra
+            # round-2 N2): a duplicate webhook after operator
+            # reconciliation must not resurrect a fulfilled order
+            # as unresolved. The receipt check and the hold insert
+            # are one transaction, so the two cannot race apart.
+            with self.store.transaction() as db:
+                receipt = db.execute(
+                    'SELECT 1 FROM purchase_receipts WHERE payment_id=?',
+                    ('stripe-order:' + row['id'],)).fetchone()
+                if receipt is None:
+                    db.execute('INSERT OR IGNORE INTO stripe_settlement_holds VALUES (?,?,?,?,?)',
+                               (row['id'], row['owner'], row['yen'], session.get('id'), time.time()))
+            if receipt is not None:
+                return {'received': True, 'processed': True}
+            return {'received': True, 'processed': False, 'held': 'terms_unrecorded'}
+        self.store.record_verified_purchase(row['owner'], 'stripe-order:' + row['id'],
+                                            row['yen'], accepted_credits=accepted)
         return {'received': True, 'processed': True}
+
+    def settlement_holds(self):
+        """Orders whose accepted terms were never recorded (Astra
+        round-1 F5): paid, verified, and deliberately unsettled
+        until an operator supplies the accepted terms."""
+        with self.store.transaction() as db:
+            rows = db.execute('SELECT * FROM stripe_settlement_holds ORDER BY created_at').fetchall()
+            return [{'order_id': row['order_id'], 'owner': row['owner'],
+                     'yen': row['yen'], 'session_id': row['session_id'],
+                     'created_at': row['created_at']} for row in rows]
+
+    def settle_held_order(self, order_id, accepted_credits):
+        """Operator reconciliation for a held order: settle it with
+        the accepted terms recovered from the original checkout
+        records, exactly once (the stored receipt governs replays).
+
+        The terms are required at this boundary (Astra round-2
+        N5): a missing or malformed amount must never fall through
+        to any current-price behavior — the hold stays untouched.
+        The reconciled terms are persisted onto the order itself,
+        so later webhook replays take the ordinary recorded-terms
+        path instead of re-holding a fulfilled order (N2)."""
+        if type(accepted_credits) is not int or accepted_credits < 1:
+            raise ValueError('Accepted purchase terms required')
+        with self.store.transaction() as db:
+            hold = db.execute('SELECT * FROM stripe_settlement_holds WHERE order_id=?',
+                              (order_id,)).fetchone()
+            if hold is None:
+                raise ValueError('No settlement hold for this order')
+        result = self.store.record_verified_purchase(
+            hold['owner'], 'stripe-order:' + order_id, hold['yen'],
+            accepted_credits=accepted_credits)
+        with self.store.transaction() as db:
+            db.execute('UPDATE stripe_orders SET credits=? WHERE id=?',
+                       (accepted_credits, order_id))
+            db.execute('DELETE FROM stripe_settlement_holds WHERE order_id=?', (order_id,))
+        return result
 
     def routes(self, verifier):
         async def checkout(request):

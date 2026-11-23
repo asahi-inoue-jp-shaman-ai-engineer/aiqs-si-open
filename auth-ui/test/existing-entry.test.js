@@ -12,6 +12,7 @@ function fixture(factors = []) {
   const forbidden = () => { calls.push(['FORBIDDEN']); throw new Error('Forbidden'); };
   const auth = {
     signInWithPassword: async value => { calls.push(['login', value]); return { data: { user: { ...user }, session } }; },
+    signInWithOtp: async value => { calls.push(['otp-request', value]); return { data: {} }; },
     resetPasswordForEmail: async value => { calls.push(['recover', value]); return { data: {} }; },
     verifyOtp: async value => { calls.push(['otp', value]); return { data: { user: { ...user }, session } }; },
     getUser: async token => { calls.push(['user', token]); return { data: { user: { ...user } } }; },
@@ -260,4 +261,237 @@ test('disposal microtask after awaited read remains terminal at every helper con
     assert.equal(f.calls.length, callsAtDisposal, `${operation}/${readNumber}: operation after disposal`);
     assert.equal(f.sent.length, 0);
   }
+});
+
+function stubNow(start) {
+  let now = start; const original = Date.now;
+  Date.now = () => now;
+  return { advance(ms) { now += ms; }, restore() { Date.now = original; } };
+}
+const otpLogin = async f => { await f.entry.requestOtpLogin('existing@example.test'); return f.entry.verifyOtpLogin('123456'); };
+
+test('email OTP login requests without user creation and hands off once', async () => {
+  const f = fixture([factor('pending', 'phone', 'unverified')]);
+  assert.deepEqual(await f.entry.requestOtpLogin('existing@example.test'), { kind: 'otp-code-required' });
+  assert.equal(f.entry.state, 'otp-code');
+  assert.deepEqual(f.calls.find(c => c[0] === 'otp-request'),
+    ['otp-request', { email: 'existing@example.test', options: { shouldCreateUser: false } }]);
+  assert.equal(f.entry.otp.attemptsLeft, 5);
+  assert.equal(f.entry.otp.sendsLeft, 4);
+  assert(f.entry.otp.resendWaitMs > 0 && f.entry.otp.resendWaitMs <= 60000);
+  assert.deepEqual(await f.entry.verifyOtpLogin('123456'), { kind: 'handed-off' });
+  assert.deepEqual(f.calls.find(c => c[0] === 'otp'),
+    ['otp', { email: 'existing@example.test', token: '123456', type: 'email' }]);
+  assert.deepEqual(f.sent, ['initial-token']);
+  assert(!f.calls.some(c => ['FORBIDDEN', 'login', 'update', 'recover'].includes(c[0])));
+  await assert.rejects(f.entry.verifyOtpLogin('123456'));
+});
+
+test('email OTP request failure returns to ready, spends the send, and a corrected address succeeds after the cooldown', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+    const f = fixture();
+    f.auth.signInWithOtp = async () => ({ error: new Error('private') });
+    await assert.rejects(f.entry.requestOtpLogin('unknown@example.test'));
+    assert.equal(f.entry.state, 'ready');
+    // The dispatched request spends the send even though it failed:
+    // the provider may have accepted it and lost the response.
+    assert.equal(f.entry.otp.sendsLeft, 4);
+    // The cooldown binds plain re-requests too, not only resends.
+    await assert.rejects(f.entry.requestOtpLogin('existing@example.test'));
+    assert.equal(f.entry.otp.sendsLeft, 4);
+    clock.advance(60000);
+    f.auth.signInWithOtp = async value => { f.calls.push(['otp-request', value]); return { data: {} }; };
+    assert.deepEqual(await f.entry.requestOtpLogin('existing@example.test'), { kind: 'otp-code-required' });
+    assert.equal(f.entry.otp.sendsLeft, 3);
+    assert.equal(f.sent.length, 0);
+  } finally { clock.restore(); }
+});
+
+test('email OTP ambiguous dispatch still spends the send and starts the cooldown', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+    const f = fixture();
+    let dispatches = 0;
+    f.auth.signInWithOtp = async () => { dispatches += 1; throw new Error('response lost'); };
+    await assert.rejects(f.entry.requestOtpLogin('existing@example.test'));
+    assert.equal(f.entry.state, 'ready');
+    assert.equal(f.entry.otp.sendsLeft, 4);
+    assert(f.entry.otp.resendWaitMs > 0);
+    await assert.rejects(f.entry.requestOtpLogin('existing@example.test'));
+    assert.equal(dispatches, 1);
+    clock.advance(60000);
+    await assert.rejects(f.entry.requestOtpLogin('existing@example.test'));
+    assert.equal(dispatches, 2);
+    assert.equal(f.entry.otp.sendsLeft, 3);
+  } finally { clock.restore(); }
+});
+
+test('email OTP failed resend keeps the code step, spends the send, and the old code still verifies', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+    const f = fixture();
+    await f.entry.requestOtpLogin('existing@example.test');
+    clock.advance(60000);
+    f.auth.signInWithOtp = async () => ({ error: new Error('private') });
+    await assert.rejects(f.entry.resendOtpLogin());
+    assert.equal(f.entry.state, 'otp-code');
+    assert.equal(f.entry.otp.sendsLeft, 3);
+    await assert.rejects(f.entry.resendOtpLogin());
+    assert.equal(f.entry.otp.sendsLeft, 3);
+    assert.deepEqual(await f.entry.verifyOtpLogin('123456'), { kind: 'handed-off' });
+  } finally { clock.restore(); }
+});
+
+test('email OTP rejected resend preserves the remaining attempts on the current code', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+    const f = fixture();
+    await f.entry.requestOtpLogin('existing@example.test');
+    f.auth.verifyOtp = async () => ({ error: new Error('private') });
+    for (let i = 0; i < 4; i++) await assert.rejects(f.entry.verifyOtpLogin('000000'));
+    assert.equal(f.entry.otp.attemptsLeft, 1);
+    clock.advance(60000);
+    f.auth.signInWithOtp = async () => ({ error: new Error('private') });
+    await assert.rejects(f.entry.resendOtpLogin());
+    assert.equal(f.entry.state, 'otp-code');
+    assert.equal(f.entry.otp.attemptsLeft, 1);
+    // The preserved budget is real: one more wrong code spends it.
+    await assert.rejects(f.entry.verifyOtpLogin('000000'));
+    assert.equal(f.entry.state, 'ready');
+    assert.equal(f.sent.length, 0);
+  } finally { clock.restore(); }
+});
+
+test('email OTP post-verification boundary failure is terminal, never a code retry', async () => {
+  const f = fixture();
+  await f.entry.requestOtpLogin('existing@example.test');
+  f.auth.getUser = async () => ({ error: new Error('private') });
+  await assert.rejects(f.entry.verifyOtpLogin('123456'));
+  assert.equal(f.entry.state, 'restart-required');
+  await assert.rejects(f.entry.verifyOtpLogin('123456'));
+  await assert.rejects(f.entry.resendOtpLogin());
+  assert.equal(f.sent.length, 0);
+});
+
+test('email OTP wrong codes stay on the code step until the attempt budget is spent', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+  const f = fixture();
+  await f.entry.requestOtpLogin('existing@example.test');
+  f.auth.verifyOtp = async value => { f.calls.push(['otp', value]); return { error: new Error('private') }; };
+  for (let spent = 1; spent <= 4; spent++) {
+    await assert.rejects(f.entry.verifyOtpLogin('000000'));
+    assert.equal(f.entry.state, 'otp-code');
+    assert.equal(f.entry.otp.attemptsLeft, 5 - spent);
+  }
+  await assert.rejects(f.entry.verifyOtpLogin('000000'));
+  assert.equal(f.entry.state, 'ready');
+  assert.equal(f.sent.length, 0);
+  // A fresh code can be requested and used after the budget reset
+  // (the resend cooldown still applies to the new request).
+  clock.advance(60000);
+  await f.entry.requestOtpLogin('existing@example.test');
+  f.auth.verifyOtp = async value => {
+    f.calls.push(['otp', value]);
+    return { data: { user: { ...f.user }, session: { access_token: 'initial-token', user: { id } } } };
+  };
+  assert.deepEqual(await f.entry.verifyOtpLogin('123456'), { kind: 'handed-off' });
+  assert.deepEqual(f.sent, ['initial-token']);
+  } finally { clock.restore(); }
+});
+
+test('email OTP malformed code spends no attempt and never reaches the provider', async () => {
+  const f = fixture();
+  await f.entry.requestOtpLogin('existing@example.test');
+  for (const bad of ['12345', '1234567', 'abcdef', 123456, null]) {
+    await assert.rejects(f.entry.verifyOtpLogin(bad));
+  }
+  assert.equal(f.entry.otp.attemptsLeft, 5);
+  assert(!f.calls.some(c => c[0] === 'otp'));
+  assert.equal(f.entry.state, 'otp-code');
+});
+
+test('email OTP resend honors the cooldown, resets attempts and stops at the send cap', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+    const f = fixture();
+    await f.entry.requestOtpLogin('existing@example.test');
+    await assert.rejects(f.entry.resendOtpLogin());
+    assert.equal(f.entry.otp.sendsLeft, 4);
+    f.auth.verifyOtp = async () => ({ error: new Error('private') });
+    await assert.rejects(f.entry.verifyOtpLogin('000000'));
+    await assert.rejects(f.entry.verifyOtpLogin('000000'));
+    assert.equal(f.entry.otp.attemptsLeft, 3);
+    clock.advance(60000);
+    assert.deepEqual(await f.entry.resendOtpLogin(), { kind: 'otp-code-required' });
+    assert.equal(f.entry.otp.attemptsLeft, 5);
+    assert.equal(f.entry.otp.sendsLeft, 3);
+    for (const left of [2, 1, 0]) {
+      clock.advance(60000);
+      await f.entry.resendOtpLogin();
+      assert.equal(f.entry.otp.sendsLeft, left);
+    }
+    clock.advance(60000);
+    await assert.rejects(f.entry.resendOtpLogin());
+    assert.equal(f.entry.state, 'restart-required');
+    await assert.rejects(f.entry.requestOtpLogin('existing@example.test'));
+    assert.equal(f.calls.filter(c => c[0] === 'otp-request').length, 5);
+  } finally { clock.restore(); }
+});
+
+test('back to email keeps the send budget across the round trip', async () => {
+  const clock = stubNow(1000000000000);
+  try {
+    const f = fixture();
+    for (let sends = 1; sends <= 4; sends++) {
+      await f.entry.requestOtpLogin('existing@example.test');
+      assert.equal(f.entry.otp.sendsLeft, 5 - sends);
+      assert.deepEqual(await f.entry.backToEmail(), { kind: 'email-required' });
+      assert.equal(f.entry.state, 'ready');
+      clock.advance(60000);
+    }
+    await f.entry.requestOtpLogin('existing@example.test');
+    assert.equal(f.entry.otp.sendsLeft, 0);
+    await f.entry.backToEmail();
+    await assert.rejects(f.entry.requestOtpLogin('existing@example.test'));
+    assert.equal(f.entry.state, 'restart-required');
+    assert.equal(f.calls.filter(c => c[0] === 'otp-request').length, 5);
+  } finally { clock.restore(); }
+});
+
+test('email OTP login composes with TOTP factors and the rotated token', async () => {
+  const f = fixture([factor()]);
+  await f.entry.requestOtpLogin('existing@example.test');
+  assert.deepEqual(await f.entry.verifyOtpLogin('123456'), { kind: 'choose-totp', factorIds: ['totp-1'] });
+  assert.equal(f.sent.length, 0);
+  await f.entry.chooseAndChallengeTOTP('totp-1');
+  await f.entry.verifyTOTP('123456');
+  assert.deepEqual(f.sent, ['rotated-token']);
+});
+
+test('disposal during email OTP verification prevents handoff', async () => {
+  const f = fixture();
+  await f.entry.requestOtpLogin('existing@example.test');
+  const gate = deferred();
+  f.auth.verifyOtp = () => gate.promise;
+  const running = f.entry.verifyOtpLogin('123456');
+  f.entry.dispose();
+  gate.resolve({ data: { user: { ...f.user }, session: { access_token: 'initial-token', user: { id } } } });
+  await assert.rejects(running);
+  assert.equal(f.entry.state, 'disposed');
+  assert.equal(f.sent.length, 0);
+});
+
+test('email OTP login completes a pending registration resumption before handoff', async () => {
+  const f = fixture();
+  const events = [];
+  const entry = createExistingEntry({
+    auth: f.auth,
+    handoff: async token => { events.push(['handoff', token]); },
+    resumeRegistration: async ({ subject, token }) => { events.push(['resume', subject, token]); },
+  });
+  await entry.requestOtpLogin('existing@example.test');
+  await entry.verifyOtpLogin('123456');
+  assert.deepEqual(events, [['resume', id, 'initial-token'], ['handoff', 'initial-token']]);
 });

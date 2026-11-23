@@ -22,6 +22,7 @@ class WebUITests(unittest.TestCase):
             (public / 'assets' / 'debug.map').write_text('not-public')
             (public / '.env').write_text('synthetic-not-public')
             (public / 'ai-agent-guide.txt').write_text('Synthetic guide')
+            (public / 'migration-guide.txt').write_text('Synthetic migration guide')
             key = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key()
             issuer = 'https://issuer.example.test/auth/v1'
             user = JWTVerifier(public_key=key, issuer=issuer, audience='https://si.example.test/mcp')
@@ -38,6 +39,9 @@ class WebUITests(unittest.TestCase):
                     self.assertEqual(response.headers['referrer-policy'], 'no-referrer')
                 self.assertEqual(client.get('/assets/app.js').status_code, 200)
                 self.assertEqual(client.get('/ai-agent-guide.txt').status_code, 200)
+                response = client.get('/migration-guide.txt')
+                self.assertEqual(response.status_code, 200)
+                self.assertIn('Synthetic migration guide', response.text)
                 for path in ['/.env', '/missing', '/assets/debug.map', '/assets/%2e%2e/.env', '/assets/%5c..%5c.env']:
                     response = client.get(path)
                     self.assertEqual(response.status_code, 404, path)

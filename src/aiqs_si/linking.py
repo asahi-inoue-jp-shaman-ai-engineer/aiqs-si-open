@@ -66,10 +66,18 @@ def confirm_link(store, client, owner, reservation_id, *, routing):
     """Step 2: finalize a verified link after explicit confirmation.
 
     Confirming also moves this account's whole SI balance into the
-    D-Planet wallet (balance_transfer in the result). If D-Planet
-    cannot be reached for the move, the link still stands and the
-    transfer stays queued for retry — it is never duplicated and
-    never silently dropped; the result reports its status either way.
+    D-Planet wallet (balance_transfer in the result) — but only
+    while credit routing is activated (batch 2b item 3): the
+    transfer is the routing switch's other half, and moving the
+    balance while consumption still settles against the SI wallet
+    strands the funds where no SI charge can reach them. While
+    routing is off the link stands, the balance stays in SI, and
+    the transfer is DEFERRED: it runs when routing is activated
+    (Store.run_deferred_link_transfers, driven by Maintenance).
+    If D-Planet cannot be reached for the move, the link still
+    stands and the transfer stays queued for retry — it is never
+    duplicated and never silently dropped; the result reports its
+    status either way.
     """
     if client is None:
         return link_unconfigured()
@@ -79,7 +87,12 @@ def confirm_link(store, client, owner, reservation_id, *, routing):
         return {"configured": True, "linked": False,
                 "error": error.message, "http_status": error.status}
     try:
-        link = store.record_account_link(owner, finalized["player_id"], finalized["link_id"])
+        # While routing is off, the deferral marker is written in
+        # the same transaction as the link itself (Astra round-1
+        # F4): the activation sweep can never miss this link.
+        link = store.record_account_link(owner, finalized["player_id"],
+                                         finalized["link_id"],
+                                         defer_transfer=not routing)
     except (ValueError, KeyError) as error:
         return {"configured": True, "linked": False, "error": str(error)}
     # Link-time referral reconciliation (fix round F-SI-3): if this
@@ -95,11 +108,18 @@ def confirm_link(store, client, owner, reservation_id, *, routing):
                 store.record_dplanet_cross_claim(owner)
     except Exception:
         pass
-    transfer = store.transfer_balance_to_dplanet(owner, client)
+    if routing:
+        transfer = store.transfer_balance_to_dplanet(owner, client)
+        balance_transfer = {"amount": transfer["amount"],
+                            "status": transfer["status"]}
+    else:
+        # The deferral was marked atomically with the link above:
+        # the activation sweep acts only on marked links, never on
+        # links that merely lack a transfer record.
+        balance_transfer = {"amount": 0, "status": "deferred"}
     return {"configured": True, "linked": True, "status": "linked",
             "dplanet_player_id": link["dplanet_player_id"], "link_id": link["link_id"],
-            "balance_transfer": {"amount": transfer["amount"],
-                                 "status": transfer["status"]},
+            "balance_transfer": balance_transfer,
             "credit_routing": "dplanet" if routing else "si_local_until_activation"}
 
 

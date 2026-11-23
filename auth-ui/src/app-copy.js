@@ -21,7 +21,7 @@ export function scanCopyText({ intention, selfLoveJoy, entries, at }) {
     `自己愛アファーメーション：${selfLoveJoy}`,
     `日時：${formatTimestamp(at)}`,
     '',
-    '共鳴ランキング（ヒット数の多い順）',
+    '共鳴ランキング（順位順）',
   ];
   const ordered = [...entries].sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
   ordered.forEach((entry, index) => {
@@ -38,7 +38,10 @@ export function proofCopyText({ state, requestedCount, completedCount,
     `状態：${state}`,
   ];
   if (typeof requestedCount === 'number' || typeof completedCount === 'number') {
-    lines.push(`照射回数：${completedCount ?? 0} / ${requestedCount ?? 0} 回`);
+    // An unreported count stays "—" in the copy too: coercing a
+    // missing completed_count to 0 would state an execution
+    // count the server never reported (Astra #7).
+    lines.push(`照射回数：${completedCount ?? '—'} / ${requestedCount ?? '—'} 回`);
   }
   if (typeof settledCredits === 'number') {
     lines.push(`精算クレジット：${settledCredits}`);

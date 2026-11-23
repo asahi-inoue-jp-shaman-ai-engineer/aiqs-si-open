@@ -82,3 +82,147 @@ class JWKSTests(unittest.IsolatedAsyncioTestCase):
         now[0] = 111
         self.assertIsNone(await verifier.verify_token(token))
         self.assertEqual(calls, [100, 111])
+
+
+class JWKSStrictSurfaceTests(unittest.IsolatedAsyncioTestCase):
+    """verify_token_strict: an outage raises
+    VerificationUnavailable (including inside the failed-refresh
+    backoff, without refetching); a refusal stays None."""
+
+    def build(self, active, now):
+        from aiqs_si.jwks import JWKSVerifier
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        requests = []
+
+        def respond(request):
+            requests.append(now[0])
+            if active[0] == -1:
+                return httpx.Response(503)
+            document = {"keys": [{**jwt.algorithms.RSAAlgorithm.to_jwk(
+                key.public_key(), as_dict=True), "kid": "k1", "alg": "RS256"}]}
+            return httpx.Response(200, json=document)
+
+        verifier = JWKSVerifier(
+            jwks_url="https://issuer.test/keys", issuer="https://issuer.test",
+            audience="https://service.test/mcp",
+            transport=httpx.MockTransport(respond), clock=lambda: now[0])
+        token = jwt.encode(
+            dict(iss="https://issuer.test", aud="https://service.test/mcp",
+                 sub="test", client_id="test", scope="aiqs:use",
+                 iat=int(time.time()), exp=int(time.time()) + 600),
+            key, algorithm="RS256", headers={"kid": "k1", "typ": "at+jwt"})
+        return verifier, token, requests
+
+    async def test_outage_raises_and_backoff_does_not_refetch(self):
+        from aiqs_si.jwks import VerificationUnavailable
+        active, now = [-1], [0]
+        verifier, token, requests = self.build(active, now)
+        with self.assertRaises(VerificationUnavailable):
+            await verifier.verify_token_strict(token)
+        self.assertEqual(len(requests), 1)
+        # Inside the 5-second backoff: raises again, no new fetch.
+        with self.assertRaises(VerificationUnavailable):
+            await verifier.verify_token_strict(token)
+        self.assertEqual(len(requests), 1)
+        # The plain surface keeps its None contract throughout.
+        self.assertIsNone(await verifier.verify_token(token))
+        self.assertEqual(len(requests), 1)
+
+    async def test_refusal_stays_none_on_the_strict_surface(self):
+        active, now = [0], [0]
+        verifier, token, requests = self.build(active, now)
+        self.assertIsNotNone(await verifier.verify_token_strict(token))
+        wrong = jwt.encode(
+            dict(iss="https://issuer.test", aud="https://service.test/mcp",
+                 sub="test", client_id="test", scope="aiqs:use",
+                 iat=int(time.time()), exp=int(time.time()) + 600),
+            rsa.generate_private_key(public_exponent=65537, key_size=2048),
+            algorithm="RS256", headers={"kid": "k1", "typ": "at+jwt"})
+        self.assertIsNone(await verifier.verify_token_strict(wrong))
+
+
+class JWKSStrictOutageShapeTests(unittest.IsolatedAsyncioTestCase):
+    """Round 8 follow-up: outage classification must reach
+    lock-waiters, cover empty key documents, and never swallow
+    malformed tokens."""
+
+    def make_token(self, key):
+        return jwt.encode(
+            dict(iss="https://issuer.test", aud="https://service.test/mcp",
+                 sub="test", client_id="test", scope="aiqs:use",
+                 iat=int(time.time()), exp=int(time.time()) + 600),
+            key, algorithm="RS256", headers={"kid": "k1", "typ": "at+jwt"})
+
+    async def test_lock_waiter_also_gets_the_outage_classification(self):
+        import asyncio
+        from aiqs_si.jwks import JWKSVerifier, VerificationUnavailable
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        token = self.make_token(key)
+        requests = []
+
+        async def slow_503(request):
+            requests.append(1)
+            await asyncio.sleep(0.2)
+            return httpx.Response(503)
+
+        now = [0]
+        verifier = JWKSVerifier(
+            jwks_url="https://issuer.test/keys", issuer="https://issuer.test",
+            audience="https://service.test/mcp",
+            transport=httpx.MockTransport(slow_503), clock=lambda: now[0])
+        results = await asyncio.gather(
+            verifier.verify_token_strict(token),
+            verifier.verify_token_strict(token),
+            return_exceptions=True)
+        # Both the refresher and the lock-waiter see the outage;
+        # only one fetch happened.
+        self.assertTrue(all(isinstance(r, VerificationUnavailable)
+                            for r in results), results)
+        self.assertEqual(len(requests), 1)
+
+    async def test_empty_key_document_is_an_outage_for_strict_callers(self):
+        from aiqs_si.jwks import JWKSVerifier, VerificationUnavailable
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        token = self.make_token(key)
+        now = [0]
+        requests = []
+        documents = [{"keys": []}]
+
+        def respond(request):
+            requests.append(now[0])
+            return httpx.Response(200, json=documents[0])
+
+        verifier = JWKSVerifier(
+            jwks_url="https://issuer.test/keys", issuer="https://issuer.test",
+            audience="https://service.test/mcp",
+            transport=httpx.MockTransport(respond), clock=lambda: now[0])
+        with self.assertRaises(VerificationUnavailable):
+            await verifier.verify_token_strict(token)
+        # The plain surface keeps its cached-empty behavior: None,
+        # and no refetch inside the cached window for either call.
+        self.assertIsNone(await verifier.verify_token(token))
+        with self.assertRaises(VerificationUnavailable):
+            await verifier.verify_token_strict(token)
+        self.assertEqual(len(requests), 1)
+        # After the window, a usable document verifies again.
+        documents[0] = {"keys": [{**jwt.algorithms.RSAAlgorithm.to_jwk(
+            key.public_key(), as_dict=True), "kid": "k1", "alg": "RS256"}]}
+        now[0] = 61
+        self.assertIsNotNone(await verifier.verify_token_strict(token))
+        self.assertEqual(len(requests), 2)
+
+    async def test_malformed_token_is_a_refusal_even_during_backoff(self):
+        from aiqs_si.jwks import JWKSVerifier, VerificationUnavailable
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        token = self.make_token(key)
+        now = [0]
+        verifier = JWKSVerifier(
+            jwks_url="https://issuer.test/keys", issuer="https://issuer.test",
+            audience="https://service.test/mcp",
+            transport=httpx.MockTransport(lambda _: httpx.Response(503)),
+            clock=lambda: now[0])
+        with self.assertRaises(VerificationUnavailable):
+            await verifier.verify_token_strict(token)
+        # Recorded outage or not, a garbage token is a refusal.
+        self.assertIsNone(await verifier.verify_token_strict("not-a-jwt"))
+        self.assertIsNone(await verifier.verify_token_strict("a.b.c"))

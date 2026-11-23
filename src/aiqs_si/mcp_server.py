@@ -127,7 +127,7 @@ def create_account_server(store, owner, *, embedded_test_worker=True, service=No
     @server.tool()
     def service_status() -> dict[str, Any]:
         """Read actual capabilities and development prices."""
-        return {"maintenance_healthy": maintenance.healthy, "mode": service.mode, "hardware_connected": None if service.mode == "hardware" else False, "registration_ready": registration_ready,
+        return {"maintenance_healthy": maintenance.healthy, "mode": service.mode, "intake_kind": getattr(service, "intake_kind", None), "hardware_connected": None if service.mode == "hardware" else False, "registration_ready": registration_ready,
                 "credits_enabled": True, "credit_kind": credit_kind, "scan_cost": 0,
                 "irradiation_credits_per_shot": active_credits_per_shot(),
                 "irradiation_standard_credits_per_shot": CREDITS_PER_SHOT,

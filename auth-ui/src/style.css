@@ -10,3 +10,55 @@ select{display:block;width:100%;border:1px solid #aab9b0;background:white;border
 
 .sub-banner{border:1px solid #ba9551;border-radius:8px;padding:14px 18px;margin:20px 0;background:linear-gradient(135deg,#fdf6e0,#fffefb);color:#263b37}.sub-banner p{margin:4px 0}.sub-banner-label{font-size:11px;letter-spacing:.15em;color:#8a6d2f}.sub-banner-title{font-size:17px;font-weight:600}.sub-banner a{color:#284b40;text-underline-offset:4px}
 .gift-overlay{border:2px solid #ba9551;border-radius:12px;padding:20px;margin:20px 0;background:#fdf6e0;text-align:center}.gift-overlay .gift-emoji{font-size:32px;margin:0}.gift-overlay #gift-text{font-size:18px;font-weight:600;margin:8px 0}
+
+/* --- UX redesign 2026-11-22: steps, waiting, hierarchy, type --- */
+.step-indicator{font-size:12px;letter-spacing:.12em;color:#63786c;margin:14px 0 0}
+.form-error{color:#9c3a2b;font-size:13px}
+button{transition:transform .12s ease,box-shadow .12s ease}
+button:active{transform:scale(.98)}
+button:disabled:active{transform:none}
+.card p{line-height:1.7}
+.pairing dd{font-variant-numeric:tabular-nums}
+#referral-details{margin:10px 0}
+#referral-details summary{cursor:pointer;font-size:14px;color:#284b40;text-underline-offset:4px}
+.pulse-orb{position:relative;width:56px;height:56px;margin:26px auto;border-radius:50%;background:radial-gradient(circle at 50% 42%,#fdf6e0,#ba9551 68%,#284b40);animation:orb-breathe 2.8s ease-in-out infinite}
+.pulse-orb::before,.pulse-orb::after{content:"";position:absolute;inset:0;border-radius:50%;border:1px solid #284b4066;animation:orb-ring 2.8s ease-out infinite}
+.pulse-orb::after{animation-delay:1.4s}
+@keyframes orb-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+@keyframes orb-ring{0%{transform:scale(1);opacity:.8}100%{transform:scale(2.1);opacity:0}}
+.skeleton{margin:22px 0}
+.skeleton-row{height:18px;border-radius:6px;margin:10px 0;background:linear-gradient(90deg,#edf2ea 25%,#f7f5ec 50%,#edf2ea 75%);background-size:200% 100%;animation:skeleton-shimmer 1.6s linear infinite}
+@keyframes skeleton-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.progress-track{height:10px;border-radius:5px;background:#edf2ea;overflow:hidden;margin:14px 0}
+.progress-bar{height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,#284b40,#ba9551);transition:width .6s ease}
+.ranking-item{animation:ranking-in .25s ease both}
+@keyframes ranking-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.pulse-orb,.pulse-orb::before,.pulse-orb::after,.skeleton-row,.ranking-item{animation:none}button{transition:none}button:active{transform:none}.progress-bar{transition:none}}
+
+/* --- New-build banner 2026-11-23 --- */
+.update-banner{border:1px solid #284b40;border-radius:8px;padding:14px 18px;margin:20px 0;background:#edf2ea;color:#263b37}
+.update-banner p{margin:4px 0}
+.update-banner .actions{margin:12px 0 4px}
+
+/* --- One-question UI 2026-11-23: web-app basics + new parts --- */
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{overscroll-behavior:none;-webkit-tap-highlight-color:transparent}
+button{user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+input,select,textarea{touch-action:manipulation}
+textarea{display:block;width:100%;border:1px solid #aab9b0;background:white;border-radius:8px;padding:13px;margin-top:6px;font:inherit;resize:vertical}
+@media(pointer:coarse){input,select,textarea{font-size:max(16px,1rem)}}
+.choice-list{display:grid;gap:12px;margin:20px 0}
+.choice-btn{display:flex;justify-content:space-between;align-items:center;gap:16px;width:100%;text-align:left;background:#fffefb;color:#263b37;border:1px solid #dce2da}
+.choice-name{font-size:16px;overflow-wrap:anywhere}
+.count-now{font-size:26px;font-weight:550;margin:14px 0 4px;font-variant-numeric:tabular-nums}
+.choice-meta{font-size:12px;color:#63786c;flex:0 0 auto}
+.gear-button{position:fixed;top:calc(10px + env(safe-area-inset-top));right:calc(10px + env(safe-area-inset-right));z-index:40;width:48px;min-height:48px;padding:0;border-radius:50%;font-size:20px;line-height:1}
+.gear-sheet{position:fixed;inset:0;z-index:50;background:#263b3766;display:flex;align-items:flex-end}
+.gear-panel{background:#fffefb;width:100%;max-height:100vh;max-height:100dvh;overflow:auto;overscroll-behavior:contain;border-radius:16px 16px 0 0;padding:20px;padding-bottom:calc(20px + env(safe-area-inset-bottom))}
+.gear-panel .actions{flex-direction:column;align-items:stretch}
+.gear-panel .actions button,.gear-panel .actions a.button-link{width:100%;text-align:center}
+
+/* --- One-question UI increment 4: history records --- */
+.history-record{border:1px solid #dce2da;border-radius:8px;padding:12px 16px;background:#fffefb;margin:12px 0}
+.history-record .history-open{width:100%;text-align:left}
+.history-record .note{margin:6px 0 0}

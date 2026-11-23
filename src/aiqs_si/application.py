@@ -42,7 +42,8 @@ class _OnboardingNoStore:
 def create_application(store, user_verifier, worker_verifier, *, allowed_workers, service=None, billing=None, ui_directory=None,
                        onboarding_config=None, onboarding_binding=None, onboarding_hook_secret=None,
                        internal_link_key=None, dplanet_client=None, payment_links=None,
-                       wellknown_transport=None, reading_provider=None):
+                       wellknown_transport=None, reading_provider=None,
+                       notification_mailer=None):
     allowed_workers = frozenset(allowed_workers)
     if user_verifier.audience == worker_verifier.audience:
         raise ValueError("User and worker audiences must be distinct")
@@ -103,17 +104,27 @@ def create_application(store, user_verifier, worker_verifier, *, allowed_workers
     from .reading import build_reading_service
     reading_service, reading_enabled = build_reading_service(
         store, provider=reading_provider)
+    # Completion notifications (job-notify-resume design): the
+    # delivery is built from the environment (Resend key) or the
+    # injected mailer (tests). Unconfigured, the store keeps the
+    # fail-soft None and the app never offers the notify choice.
+    from .notifications import build_notification_delivery
+    notification_delivery = build_notification_delivery(
+        store, mailer=notification_mailer)
+    store.notification_delivery = notification_delivery
     standalone = app_routes(store, user_verifier, service=service,
                             dplanet_client=dplanet_client,
                             dplanet_routing=routing_enabled_from_env(),
                             enabled=app_enabled,
                             reading_service=reading_service,
                             reading_enabled=reading_enabled,
-                            referral_enabled=referral_enabled_from_env())
+                            referral_enabled=referral_enabled_from_env(),
+                            notify_configured=notification_delivery is not None)
     from .web_ui import ui_routes
     public_routes = ui_routes(ui_directory, user_verifier.issuer,
                               app_enabled=app_enabled) if ui_directory else []
-    middleware = [Middleware(RequestBodyLimit, worker_verifier=worker_verifier, allowed_workers=allowed_workers)]
+    middleware = [Middleware(RequestBodyLimit, worker_verifier=worker_verifier, allowed_workers=allowed_workers,
+                             account_verifier=user_verifier)]
     if onboarding is not None:
         middleware.append(Middleware(_OnboardingDispatch, onboarding=onboarding))
     from .wellknown import wellknown_routes

@@ -65,8 +65,13 @@ class RemoteQueue:
             raise ValueError("Remote catalog integrity failure")
         return {field["name"]: field["entries"] for field in data["fields"]}
 
-    def finish(self, job, state, result):
-        body = {"job_id": job, "state": state, "result": result, **self._claim_fields()}
+    def finish(self, job, state, result, *, claim_generation=None):
+        # An explicit generation (an outbox replay presenting the
+        # generation recorded with the result, batch 2b item 2)
+        # overrides the active claim's; the live path passes none.
+        fields = {"claim_generation": claim_generation} \
+            if type(claim_generation) is int else self._claim_fields()
+        body = {"job_id": job, "state": state, "result": result, **fields}
         if self.diode_serial_hash:
             body["diode_serial_hash"] = self.diode_serial_hash
         if self._post("/worker/finish", body) != {"ok": True}:
@@ -80,9 +85,11 @@ class RemoteQueue:
         if self._post('/worker/heartbeat', {'job_id': job, **self._claim_fields()}) != {'ok': True}:
             raise ConnectionError('Heartbeat not acknowledged')
 
-    def reconcile_scan_receipt(self, job, digest):
+    def reconcile_scan_receipt(self, job, digest, *, claim_generation=None):
+        fields = {"claim_generation": claim_generation} \
+            if type(claim_generation) is int else self._claim_fields()
         if self._post("/worker/scan-receipt",
-                      {"job_id": job, "digest": digest, **self._claim_fields()}) != {'ok': True}:
+                      {"job_id": job, "digest": digest, **fields}) != {'ok': True}:
             raise ConnectionError("Scan receipt not acknowledged")
 
     def get_context(self, job):

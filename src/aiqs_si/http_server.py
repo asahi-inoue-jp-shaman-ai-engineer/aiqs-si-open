@@ -7,6 +7,7 @@ from pathlib import Path
 from .auth import JWTVerifier, create_http_server
 from .store import Store
 from .service import Service
+from .deployment import production_environment
 from .catalog import load_snapshot
 from .execution_settings import ExecutionSettings
 from .application import create_application
@@ -41,6 +42,12 @@ def main():
     parser.add_argument('--onboarding-manifest', help='Explicit deployment manifest for opt-in onboarding')
     parser.add_argument('--onboarding-binding', help='Independent existing identity namespace binding JSON')
     args = parser.parse_args()
+    # Fail-closed interlock (owner decision, 2026-11-23): intake for
+    # the production issuer without explicit hardware settings would
+    # run in synthetic mode; refuse to start instead.
+    if not args.hardware_settings and production_environment(url=args.issuer):
+        parser.error("Production intake requires --hardware-settings: "
+                     "synthetic-mode intake is forbidden in production")
     if bool(args.worker_audience) != bool(args.allowed_worker):
         parser.error("Worker audience and allowed-worker must be configured together")
     if args.ui_directory and not args.worker_audience:
@@ -56,6 +63,16 @@ def main():
         onboarding = load_onboarding(args, os.environ)
     except ValueError:
         parser.error('Invalid onboarding startup configuration')
+    # Policy posture gate (Astra final round #5): production starts
+    # only with explicit pricing/grant/limit policies in the env
+    # (explicit null limits count as an explicit choice), or with
+    # the operator's explicit AIQS_SI_ALLOW_DEFAULT_POLICIES=1
+    # acknowledgement of the built-in defaults. Runs before any
+    # store, key, or listener is created.
+    from .policies import policy_posture_problems
+    posture = policy_posture_problems(os.environ)
+    if posture:
+        parser.error("Operator policy posture incomplete: " + "; ".join(posture))
     key = Path(args.public_key).read_text(encoding="utf-8") if args.public_key else None
     if key and "PRIVATE KEY" in key:
         parser.error("Use a public key only")
@@ -89,7 +106,8 @@ def main():
         settings = ExecutionSettings(**json.loads(Path(args.hardware_settings).read_text(encoding="utf-8")))
         catalog, metadata = load_snapshot(args.catalog, args.catalog_sha256)
         service = Service(store, catalog, execution_settings=settings,
-                          profile_salt=os.environ.get("AIQS_SI_PROFILE_SALT"))
+                          profile_salt=os.environ.get("AIQS_SI_PROFILE_SALT"),
+                          production=production_environment(url=args.issuer))
     elif args.catalog or args.catalog_sha256:
         parser.error("Catalog options require explicit hardware settings")
     if args.worker_audience:
@@ -115,7 +133,7 @@ def main():
     import uvicorn
     from .request_limits import RequestBodyLimit
     app = create_mcp_http_app(server)
-    app.add_middleware(RequestBodyLimit)
+    app.add_middleware(RequestBodyLimit, account_verifier=verifier)
     uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
 
 

@@ -9,7 +9,17 @@ catalog pinned by the job's catalog_digest (never from the
 worker-returned payload), and resonance internals (qrs, group,
 total_mfs, selected_mfs, threshold, limits, catalog_digest, storage
 paths, media URLs, descriptions) have no path out.
+
+The scalar fields that DO leave (mode, reason, counts, flags) pass
+through the strict public result schema (result_schema): mode and
+reason are fixed vocabularies, counts are bounded integers, flags
+are booleans. A worker result carrying a nested object or a
+free-form diagnostic string in one of those fields publishes
+nothing for that field.
 """
+from .result_schema import (MAX_SCAN_ENTRIES, PUBLIC_SCAN_ENTRIES,
+                            public_bool, public_count, public_entry_id,
+                            public_mode, public_rank, public_reason)
 
 
 def _int_or_none(value):
@@ -27,14 +37,27 @@ def _public_entries(store, payload, raw_entries):
         if catalog:
             for field_name, entries in catalog.items():
                 for entry in entries:
-                    if isinstance(entry, dict) and entry.get("id") is not None:
+                    if isinstance(entry, dict) and public_entry_id(entry.get("id")) is not None:
                         index[entry["id"]] = (field_name, entry.get("text"))
     public = []
     if isinstance(raw_entries, list):
-        for raw in raw_entries:
+        seen = set()
+        for raw in raw_entries[:MAX_SCAN_ENTRIES]:
             if not isinstance(raw, dict):
                 continue
-            entry_id = raw.get("id") or raw.get("entry_id")
+            # A malformed identifier (list, dict, oversized string)
+            # never reaches the index lookup: it would be unhashable
+            # or unresolvable, and a legacy row must not poison the
+            # read of an otherwise valid scan.
+            entry_id = public_entry_id(raw.get("id") or raw.get("entry_id"))
+            if entry_id is None:
+                continue
+            # Each entry id publishes at most once (the catalog index
+            # resolves an id to exactly one field/text pair, so a
+            # repetition could only multiply the hits/rank channel).
+            if entry_id in seen:
+                continue
+            seen.add(entry_id)
             resolved = index.get(entry_id)
             if resolved is None:
                 # Unresolvable against the pinned catalog: the entry
@@ -42,20 +65,31 @@ def _public_entries(store, payload, raw_entries):
                 continue
             field_name, text = resolved
             public.append({"entry_id": entry_id, "field_name": field_name,
-                           "text": text, "hits": _int_or_none(raw.get("hits")),
-                           "rank": _int_or_none(raw.get("rank"))})
+                           "text": text, "hits": public_count(raw.get("hits")),
+                           "rank": public_rank(raw.get("rank"))})
     public.sort(key=lambda entry: (entry["rank"] is None, entry["rank"]))
+    # Publication is bounded by the engine contract, and a rank is
+    # only meaningful within the list actually published: a rank
+    # beyond the published length (reachable when duplicate or
+    # excess entries padded the stored list) publishes as None.
+    public = public[:PUBLIC_SCAN_ENTRIES]
+    for entry in public:
+        if entry["rank"] is not None and entry["rank"] > len(public):
+            entry["rank"] = None
     return public
 
 
 def _public_result(store, payload, result):
     view = {}
-    if isinstance(result.get("mode"), str):
-        view["mode"] = result["mode"]
-    if isinstance(result.get("physical_output_verified"), bool):
-        view["physical_output_verified"] = result["physical_output_verified"]
-    if isinstance(result.get("reason"), str):
-        view["reason"] = result["reason"]
+    mode = public_mode(result.get("mode"))
+    if mode is not None:
+        view["mode"] = mode
+    verified = public_bool(result.get("physical_output_verified"))
+    if verified is not None:
+        view["physical_output_verified"] = verified
+    reason = public_reason(result.get("reason"))
+    if reason is not None:
+        view["reason"] = reason
     operation = payload.get("operation")
     if operation == "scan":
         scan = result.get("scan")
@@ -63,16 +97,18 @@ def _public_result(store, payload, result):
         view["scan"] = {
             "final_entries": _public_entries(store, payload,
                                              scan.get("final_entries")),
-            "observer_coordinate_applied": bool(
-                scan.get("observer_coordinate_applied")),
+            "observer_coordinate_applied":
+                public_bool(scan.get("observer_coordinate_applied")) is True,
         }
     elif operation == "irradiation":
         for key in ("requested_count", "completed_count", "simulated_count"):
-            if type(result.get(key)) is int:
-                view[key] = result[key]
+            count = public_count(result.get(key))
+            if count is not None:
+                view[key] = count
         for key in ("stop_command_acknowledged", "executed_physically"):
-            if isinstance(result.get(key), bool):
-                view[key] = result[key]
+            flag = public_bool(result.get(key))
+            if flag is not None:
+                view[key] = flag
     return view
 
 

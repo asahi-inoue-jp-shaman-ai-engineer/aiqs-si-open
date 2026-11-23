@@ -20,13 +20,31 @@ test('scan copy text follows the decided format (design §4.2)', () => {
     '自己愛アファーメーション：わたしは わたしのままで 愛されている',
     '日時：2026-11-22 05:40',
     '',
-    '共鳴ランキング（ヒット数の多い順）',
+    '共鳴ランキング（順位順）',
     '1. 分野A｜本文その1（ヒット数 128）',
     '2. 分野B｜本文その2（ヒット数 121）',
     '3. 分野C｜本文その3（ヒット数 117）',
   ].join('\n'));
   // entry_id is an ordering identifier only and never pasted.
   assert.ok(!text.includes('e1'));
+});
+
+test('scan copy order follows rank, not hits (the serializer sorts by rank)', () => {
+  // The public serializer orders entries by their rank field; rank
+  // order and hit-count order are not the same thing, so the copy
+  // must neither re-sort by hits nor claim a hit-count ordering.
+  const text = scanCopyText({
+    intention: '意図', selfLoveJoy: 'アファーメーション',
+    entries: [
+      { entry_id: 'x1', field_name: '分野X', text: 'ヒットは多いが順位は2', hits: 200, rank: 2 },
+      { entry_id: 'x2', field_name: '分野Y', text: 'ヒットは少ないが順位は1', hits: 50, rank: 1 },
+    ],
+    at: new Date(2026, 10, 22, 5, 40),
+  });
+  const lines = text.split('\n');
+  assert.ok(lines.indexOf('1. 分野Y｜ヒットは少ないが順位は1（ヒット数 50）')
+    < lines.indexOf('2. 分野X｜ヒットは多いが順位は2（ヒット数 200）'));
+  assert.ok(!text.includes('ヒット数の多い順'));
 });
 
 test('proof copy text carries only the public proof fields', () => {
@@ -99,4 +117,14 @@ test('reading copy text carries the AI label and the §4.2 header', () => {
     '',
     '【キーワード群】\n読み解き本文',
   ].join('\n'));
+});
+
+test('proof copy keeps an unreported completed count as unknown, never zero', () => {
+  const text = proofCopyText({
+    state: '完了', requestedCount: 33, completedCount: undefined,
+    settledCredits: null, publicDeviceId: null, proofDigest: null,
+    at: new Date(2026, 10, 23, 9, 30),
+  });
+  assert.ok(text.includes('照射回数：— / 33 回'));
+  assert.ok(!text.includes('0 / 33'));
 });

@@ -30,7 +30,9 @@ pattern): while unset the routes answer 404, the safe pre-launch
 state, and the /app page is not served either (web_ui).
 """
 import asyncio
+import json
 import os
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -45,6 +47,7 @@ from .pricing import (CAMPAIGN_ACTIVE, CAMPAIGN_NAME, CREDITS_PER_SHOT,
                       active_rate_tenths, irradiation_quote, reading_quote)
 from .reading import ReadingGenerationError
 from .referral import ReferralError
+from .scan_rejections import scan_error_code
 from .serializers import public_job_view
 from .store import ReadingChargeError
 
@@ -79,7 +82,7 @@ def _iso(epoch):
 def app_routes(store, verifier, *, service, dplanet_client=None,
                dplanet_routing=False, enabled=True,
                reading_service=None, reading_enabled=False,
-               referral_enabled=False):
+               referral_enabled=False, notify_configured=False):
     """User-authenticated app routes for the combined application.
 
     The reading routes (native-reading-design-20261122) exist only
@@ -108,6 +111,37 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
     def request_key_of(body):
         key = body.get("request_key")
         return key if isinstance(key, str) and 1 <= len(key) <= 128 else None
+
+    def completion_choice(body):
+        """The per-submission wait/notify choice (job-notify-resume
+        design). Absent means wait — the historical behaviour — and
+        anything malformed is a client error, never a silent guess:
+        the API must not invent a delivery preference."""
+        raw = body.get("completion")
+        if raw is None:
+            return "wait"
+        if not isinstance(raw, dict):
+            raise ValueError("invalid_completion_mode")
+        mode = raw.get("mode", "wait")
+        if mode not in ("wait", "notify"):
+            raise ValueError("invalid_completion_mode")
+        return mode
+
+    def notify_available(token):
+        """Notify mode can be honoured only when delivery is
+        configured AND the verified access token carries the user's
+        own email claim — the only address the service may use."""
+        return bool(notify_configured and token is not None
+                    and getattr(token, "email", None))
+
+    def completion_view(job_id):
+        """The choice as recorded (first record wins), plus the
+        notification lifecycle state. The address itself is never
+        part of any response."""
+        row = store.job_notification(job_id)
+        if row is None:
+            return {"mode": "wait", "notification": "none"}
+        return {"mode": row["mode"], "notification": row["status"]}
 
     def balance_view(owner):
         """The credit_balance semantics of the MCP surface: while
@@ -139,31 +173,94 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         view["available"] = store.balance(owner)
         return view
 
+    def degraded_job_view(owner, job_id, attributed):
+        """job_view when the stored payload no longer decodes
+        (legacy corruption): the job's columns and the durable
+        display summary still answer, and every payload- or
+        proof-derived field is null — unavailable, never invented.
+        Strict paths (execution, admission, the proof endpoint)
+        keep failing on such a payload; only this owner-facing
+        read degrades."""
+        columns = store.job_columns(owner, job_id)
+        display = store.display_summary(owner, {"id": job_id})
+        queue = store.queue_status(owner, job_id)
+        return {"job_id": job_id, "operation": None,
+                "state": columns["state"], "cost": columns["cost"],
+                "result": None,
+                "intention": display["intention"],
+                "self_love_joy": display["self_love_joy"],
+                "targets": display["targets"],
+                "execution": None, "device": None, "settlement": None,
+                "proof_digest": None,
+                "consent": attributed["consent"] if attributed else None,
+                "queue": {"position": queue["position"],
+                          "jobs_ahead": queue["jobs_ahead"]}}
+
     def job_view(owner, job_id):
         """The app status payload for one of the owner's app jobs:
         the public serializer's job view plus the public proof
         bundle's display fields (execution/device/settlement/digest),
         mirroring the internal API's status shape minus player data."""
-        job = store.get(owner, job_id)
-        proof = store.execution_proof(owner, job_id)
         attributed = store.app_job(job_id)
-        view = public_job_view(store, job)
-        queue = store.queue_status(owner, job_id)
-        payload = job["payload"]
-        return {"job_id": job_id, "operation": view.get("operation"),
+        try:
+            job = store.get(owner, job_id)
+            if job["state"] in ("completed", "failed", "cancelled", "unknown"):
+                # Seeing the terminal state is the "the user is back"
+                # signal: a pending completion notification for a result
+                # already on screen would be a lie about needing one.
+                # The view is recorded durably, independent of whether
+                # a notification record exists yet.
+                store.mark_result_viewed(owner, job_id)
+            proof = store.execution_proof(owner, job_id)
+            view = public_job_view(store, job)
+            queue = store.queue_status(owner, job_id)
+            display = store.display_summary(owner, job)
+            result_view = {
+                "job_id": job_id, "operation": view.get("operation"),
                 "state": job["state"], "cost": job["cost"],
                 "result": view.get("result"),
+                "completion": completion_view(job_id),
                 # The user's own words, returned to themself only:
                 # the §4.2 copy format heads the ranking with the
                 # intention and self-love affirmation the user typed.
-                "intention": payload.get("intention"),
-                "self_love_joy": payload.get("self_love_joy"),
+                # The display summary is the durable submit-time
+                # snapshot, so the confirmation screen's "show
+                # everything" (targets included) also holds for a
+                # scan reopened from history after its content
+                # expired; jobs predating summaries fall back to the
+                # payload while it survives.
+                "intention": display["intention"],
+                "self_love_joy": display["self_love_joy"],
+                "targets": display["targets"],
                 "execution": proof["execution"], "device": proof["device"],
                 "settlement": proof["settlement"],
                 "proof_digest": proof["proof_digest"],
                 "consent": attributed["consent"] if attributed else None,
                 "queue": {"position": queue["position"],
                           "jobs_ahead": queue["jobs_ahead"]}}
+            # Encoding preflight with the exact options the
+            # response renderer (Starlette JSONResponse) uses: a
+            # payload-derived string carrying an unpaired
+            # surrogate (legacy storage) decodes and serializes
+            # fine with ASCII escaping, but fails strict UTF-8
+            # encoding at render time — after this function has
+            # returned. Preflighting inside the guard degrades
+            # such a view instead of failing the response.
+            json.dumps(result_view, ensure_ascii=False, allow_nan=False,
+                       separators=(",", ":")).encode("utf-8")
+        except (ValueError, AttributeError, TypeError, RecursionError):
+            # ValueError, not just JSONDecodeError: decoding can
+            # also fail on oversized integers, proof serialization
+            # rejects non-finite payload numbers, and the encoding
+            # preflight raises UnicodeEncodeError (a ValueError)
+            # on unencodable payload-derived strings — all are
+            # stored-data failures this read must survive.
+            degraded = degraded_job_view(owner, job_id, attributed)
+            if degraded["state"] in ("completed", "failed", "cancelled",
+                                        "unknown"):
+                store.mark_result_viewed(owner, job_id)
+            return degraded
+        return result_view
 
     async def session(request):
         if not enabled:
@@ -175,6 +272,11 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         view["reading"] = {"enabled": bool(reading_enabled and reading_service),
                            "credits": READING_CREDITS}
         view["referral"] = {"enabled": bool(referral_enabled)}
+        # Whether the notify choice can be offered at all on this
+        # account right now (delivery configured + verified email
+        # claim). The UI hides the choice when this is false instead
+        # of letting the user pick something the service cannot do.
+        view["notify"] = {"available": notify_available(_token)}
         return JSONResponse(view)
 
     async def targets_list(request):
@@ -248,7 +350,7 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
     async def jobs_scan(request):
         if not enabled:
             return denied()
-        owner, _token = await authenticate(request)
+        owner, token = await authenticate(request)
         if owner is None:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if service is None:
@@ -259,23 +361,111 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         request_key = request_key_of(body)
         if request_key is None:
             return JSONResponse({"error": "request_key required"}, status_code=400)
+        try:
+            mode = completion_choice(body)
+        except ValueError:
+            return JSONResponse({"error": "invalid_completion_mode"},
+                                status_code=400)
         existing = await asyncio.to_thread(store.get_by_request, owner, request_key)
-        if existing is not None and (await asyncio.to_thread(
-                store.app_job, existing["id"])) is None:
-            # The key belongs to another channel; never re-attribute.
+        intent = await asyncio.to_thread(store.app_submission_intent,
+                                         owner, request_key)
+        if intent is not None and intent["operation"] != "scan":
+            # The key is bound to a different operation's intent
+            # (Astra round-5 F13): operation is part of the binding,
+            # so this key can never serve a scan.
             return JSONResponse({"error": "request_key already used"}, status_code=409)
+        if existing is not None and (await asyncio.to_thread(
+                store.app_job, existing["id"])) is None and not (
+                intent is not None
+                and intent["intent_id"]
+                and existing["payload"].get("operation") == "scan"
+                and existing["payload"].get("app_intent")
+                == intent["intent_id"]):
+            # The key belongs to another channel; never re-attribute.
+            # The one exception is our own crashed attempt, proven —
+            # not merely suggested — by the intent id stamped into
+            # the job's payload at creation: attribution, with the
+            # intent's original choice, is completed below instead
+            # of refused. An intent alone proves nothing (a rejected
+            # submission leaves one behind only until it is
+            # discarded, and it is never bound to a foreign job).
+            return JSONResponse({"error": "request_key already used"}, status_code=409)
+        created_intent = False
+        if existing is None:
+            # Persist the intent BEFORE the job is created, so the
+            # original choice survives any crash from here on and
+            # recovery never has to invent a preference. The row
+            # that WINS the insert governs — a concurrent or earlier
+            # attempt's choice is authoritative, not this request's
+            # presentation — and the availability policy applies to
+            # the WINNER (Astra round-5 F2): a durable notify intent
+            # is refused while delivery cannot honour it, whatever
+            # this request presented, and a durable wait intent is
+            # never blocked by a presented notify.
+            intent, created_intent = await asyncio.to_thread(
+                store.record_app_submission_intent, owner, request_key,
+                operation="scan", mode=mode,
+                email=getattr(token, "email", None))
+            if intent["operation"] != "scan":
+                # The WINNING row is another operation's intent,
+                # inserted after this request's initial lookup
+                # (Astra round-6 F13): the binding is checked on
+                # the winner, never only on the earlier read.
+                return JSONResponse({"error": "request_key already used"},
+                                    status_code=409)
+            if intent["mode"] == "notify" and not (
+                    notify_configured and intent["email"]):
+                if created_intent:
+                    await asyncio.to_thread(
+                        store.discard_app_submission_intent, owner,
+                        request_key, intent["intent_id"])
+                return JSONResponse({"error": "notify_unavailable"},
+                                    status_code=400)
+
+        async def discard_own_intent():
+            if created_intent:
+                await asyncio.to_thread(
+                    store.discard_app_submission_intent, owner,
+                    request_key, intent["intent_id"])
+
         try:
             job = await asyncio.to_thread(
                 service.submit_scan, owner, request_key, body.get("intention"),
-                body.get("target_ids"), self_love_joy=body.get("self_love_joy"))
+                body.get("target_ids"), self_love_joy=body.get("self_love_joy"),
+                app_intent_id=intent["intent_id"] if intent else None)
         except KeyError:
+            await discard_own_intent()
             return JSONResponse({"error": "Target not found"}, status_code=404)
-        except (ValueError, TypeError):
-            return JSONResponse({"error": "scan_rejected"}, status_code=400)
-        await asyncio.to_thread(store.record_app_job, job["id"], owner=owner,
-                                operation="scan")
+        except (ValueError, TypeError) as error:
+            await discard_own_intent()
+            # Typed rejection codes (batch 2b item 7): quota, budget
+            # and configuration failures are distinct from malformed
+            # input, so the app can say what actually happened.
+            return JSONResponse({"error": scan_error_code(error)}, status_code=400)
+        # The recorded choice comes from the intent (first record
+        # wins end to end). A job that predates intents falls back
+        # to the presented choice, gated by current availability.
+        if intent is not None:
+            choice = {"mode": intent["mode"], "email": intent["email"]}
+        else:
+            choice = {"mode": mode if notify_available(token) else "wait",
+                      "email": getattr(token, "email", None)}
+        try:
+            await asyncio.to_thread(
+                store.record_app_job, job["id"], owner=owner,
+                operation="scan", notification=choice,
+                **({"require_intent_id": intent["intent_id"]}
+                   if intent is not None else {}))
+        except ValueError:
+            # The job the service returned is not the job this
+            # intent created (a foreign job won the request-key
+            # race): refuse rather than attribute it (round-5 F11).
+            return JSONResponse({"error": "request_key already used"},
+                                status_code=409)
+        completion = await asyncio.to_thread(completion_view, job["id"])
         return JSONResponse({"job_id": job["id"], "state": job["state"],
-                             "operation": "scan", "cost": job["cost"]})
+                             "operation": "scan", "cost": job["cost"],
+                             "completion": completion})
 
     async def jobs_irradiate_prepare(request):
         """S5's server side: validate the scan and park the shown
@@ -344,6 +534,11 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         confirmation_id = body.get("confirmation_id")
         if not isinstance(confirmation_id, str) or not confirmation_id:
             return JSONResponse({"error": "confirmation_id required"}, status_code=400)
+        try:
+            mode = completion_choice(body)
+        except ValueError:
+            return JSONResponse({"error": "invalid_completion_mode"},
+                                status_code=400)
         def consent_record(confirmation):
             return {"owner": owner, "subject": token.subject,
                     "client_id": token.client_id,
@@ -353,15 +548,50 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                     "credits_per_shot": confirmation["credits_per_shot"],
                     "total_credits": confirmation["total_credits"]}
 
-        def job_response(job):
+        async def job_response(job):
+            completion = await asyncio.to_thread(completion_view, job["id"])
             return JSONResponse({"job_id": job["id"], "state": job["state"],
                                  "operation": "irradiation", "cost": job["cost"],
-                                 "quote": job["payload"].get("quote")})
+                                 "quote": job["payload"].get("quote"),
+                                 "completion": completion})
 
         confirmation = await asyncio.to_thread(store.app_confirmation, owner,
                                                confirmation_id)
         if confirmation is None:
             return JSONResponse({"error": "confirmation_not_found"}, status_code=400)
+        # The durable choice for this request key (Astra round-4
+        # F2): recorded before anything else can commit, first
+        # record wins, and the WINNING row — not this request's
+        # presentation — governs every path below, so a crashed
+        # first attempt's original choice is what recovery uses.
+        # The verified consent snapshot is persisted with it
+        # (round-5 F2), so maintenance can finalize a crashed
+        # attempt with exactly these records. Operation and
+        # confirmation reference are immutable parts of the
+        # binding (round-5 F13): a winner naming another operation
+        # or confirmation refuses the key outright.
+        intent, intent_created = await asyncio.to_thread(
+            store.record_app_submission_intent, owner, request_key,
+            operation="irradiation", mode=mode,
+            email=getattr(token, "email", None),
+            reference=confirmation_id,
+            consent=consent_record(confirmation))
+        if intent["operation"] != "irradiation" \
+                or intent["reference"] != confirmation_id:
+            return JSONResponse({"error": "request_key already used"},
+                                status_code=409)
+        choice = {"mode": intent["mode"], "email": intent["email"]}
+
+        def effective_choice():
+            """The choice as it may be recorded by a recovery path:
+            an intent created by THIS request while delivery cannot
+            honour notify downgrades to wait (the fresh path refuses
+            instead); a pre-existing intent was recorded under a
+            valid configuration and stands verbatim."""
+            if intent_created and choice["mode"] == "notify" \
+                    and not (notify_configured and choice["email"]):
+                return {"mode": "wait", "email": choice["email"]}
+            return choice
         # Request-key replay: the same confirmation already produced
         # this job; answer with it instead of consuming anything.
         existing = await asyncio.to_thread(store.get_by_request, owner, request_key)
@@ -371,7 +601,18 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                 consent = attributed["consent"] or {}
                 if attributed["operation"] == "irradiation" \
                         and consent.get("confirmation_id") == confirmation_id:
-                    return job_response(existing)
+                    # Repair pass: if the original attempt committed
+                    # attribution but lost the notification record
+                    # (crash between the two writes), record the
+                    # presented choice now. INSERT OR IGNORE makes
+                    # this a no-op whenever the record exists, so the
+                    # first choice still wins.
+                    repair = effective_choice()
+                    await asyncio.to_thread(
+                        store.set_job_notification, existing["id"],
+                        owner=owner, operation="irradiation",
+                        mode=repair["mode"], email=repair["email"])
+                    return await job_response(existing)
                 return JSONResponse({"error": "request_key already used"},
                                     status_code=409)
             # The job exists but was never attributed: an earlier
@@ -384,15 +625,25 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             if existing["payload"].get("operation") == "irradiation" \
                     and existing["payload"].get("scan_id") == confirmation["scan_id"] \
                     and existing["cost"] == confirmation["total_credits"]:
+                # Recovery path: the job already exists and was
+                # charged, so refusing here would strand it. The
+                # durable choice is recorded atomically with the
+                # attribution (effective form: an intent created by
+                # this very request while delivery is unconfigured
+                # records wait, and the response reports what was
+                # recorded).
+                repair = effective_choice()
                 try:
                     await asyncio.to_thread(
-                        store.record_app_irradiation, existing["id"], owner=owner,
-                        consent=consent_record(confirmation),
-                        confirmation_id=confirmation_id, request_key=request_key)
+                        store.record_app_irradiation, existing["id"],
+                        owner=owner, consent=consent_record(confirmation),
+                        confirmation_id=confirmation_id,
+                        request_key=request_key,
+                        notification=repair)
                 except ValueError:
                     return JSONResponse({"error": "request_key already used"},
                                         status_code=409)
-                return job_response(existing)
+                return await job_response(existing)
             return JSONResponse({"error": "request_key already used"}, status_code=409)
         # The charge must equal the quote the user confirmed; a price
         # change since prepare returns the user to S5, never a
@@ -404,6 +655,21 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         if (current["credits_per_shot_tenths"], current["credits"]) != \
                 (confirmation["credits_per_shot_tenths"], confirmation["total_credits"]):
             return JSONResponse({"error": "quote_changed"}, status_code=400)
+        if choice["mode"] == "notify" \
+                and not (notify_configured and choice["email"]):
+            # Fresh submissions only (replays above stay answerable):
+            # refuse before the confirmation is claimed, so nothing
+            # is consumed by a promise the service cannot keep. The
+            # winning intent governs: its address was captured from a
+            # verified token, so configuration is what matters here.
+            # An intent created by this refused attempt is discarded
+            # with it, so a later retry may present a different
+            # choice; a pre-existing intent stands.
+            if intent_created:
+                await asyncio.to_thread(
+                    store.discard_app_submission_intent, owner,
+                    request_key, intent["intent_id"])
+            return JSONResponse({"error": "notify_unavailable"}, status_code=400)
         # Claim the confirmation atomically BEFORE submitting
         # anything. Only the claim holder may create the job, so a
         # concurrent confirm with a different request key can never
@@ -426,12 +692,14 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             # the confirmation is spent.
             winner = await asyncio.to_thread(store.get_by_request, owner, request_key)
             if winner is not None and winner["id"] == claim["job_id"]:
-                return job_response(winner)
+                return await job_response(winner)
             return JSONResponse({"error": "confirmation_already_used"}, status_code=400)
         try:
             job = await asyncio.to_thread(
                 service.submit_irradiation, owner, request_key,
-                confirmation["scan_id"], count=confirmation["count"])
+                confirmation["scan_id"], count=confirmation["count"],
+                app_intent_id=intent["intent_id"],
+                confirmation_id=confirmation_id)
         except KeyError:
             await asyncio.to_thread(store.release_app_confirmation_claim,
                                     owner, confirmation_id, request_key)
@@ -440,11 +708,16 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             await asyncio.to_thread(store.release_app_confirmation_claim,
                                     owner, confirmation_id, request_key)
             return JSONResponse({"error": "irradiation_rejected"}, status_code=400)
-        await asyncio.to_thread(store.record_app_irradiation, job["id"], owner=owner,
-                                consent=consent_record(confirmation),
-                                confirmation_id=confirmation_id,
-                                request_key=request_key)
-        return job_response(job)
+        try:
+            await asyncio.to_thread(
+                store.record_app_irradiation, job["id"], owner=owner,
+                consent=consent_record(confirmation),
+                confirmation_id=confirmation_id, request_key=request_key,
+                notification=choice)
+        except ValueError:
+            return JSONResponse({"error": "request_key already used"},
+                                status_code=409)
+        return await job_response(job)
 
     # --- Native-app AI reading (native-reading-design-20261122) ---
     # The optional, credit-charged exception to the app's AI-free
@@ -525,11 +798,9 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         confirmation_id = body.get("confirmation_id")
         if not isinstance(confirmation_id, str) or not confirmation_id:
             return JSONResponse({"error": "confirmation_id required"}, status_code=400)
-        # Request-key replay: the stored outcome is the answer —
-        # the provider is never called twice for one key, and no
-        # second charge can occur (design §4.2).
-        existing = await asyncio.to_thread(store.reading_by_request, owner, request_key)
-        if existing is not None:
+
+        async def replay_answer(existing):
+            """The stored outcome as this endpoint's answer."""
             if existing["state"] == "completed":
                 balance = await asyncio.to_thread(balance_view, owner)
                 view = reading_view(existing)
@@ -537,10 +808,45 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                 view["balance_after"] = balance.get("available")
                 return JSONResponse(view)
             if existing["state"] == "failed":
+                # A stored TERMINAL failure is identified as such
+                # (Astra round-4 N8): the client must be able to
+                # tell "this purchase is finished and refunded —
+                # clear the pending record" apart from a fresh
+                # reading_unavailable refusal, which carries no
+                # reading identity and may still heal under the
+                # same request key.
                 return JSONResponse(
-                    {"error": existing["error_code"] or "reading_unavailable"},
+                    {"error": existing["error_code"] or "reading_unavailable",
+                     "reading_id": existing["id"], "state": "failed",
+                     "terminal": True},
                     status_code=400)
             return JSONResponse(reading_view(existing))
+
+        # Request-key replay: the stored outcome is the answer —
+        # the provider is never called twice for one key, and no
+        # second charge can occur (design §4.2).
+        existing = await asyncio.to_thread(store.reading_by_request, owner, request_key)
+        if existing is not None:
+            # Input identity (batch 2b item 9): the stored outcome is
+            # the answer only for the SAME request — the presented
+            # confirmation must be the one that authorized the stored
+            # reading. A key reused with another scan's confirmation
+            # is a conflict, never a silent answer with the wrong
+            # reading.
+            if existing["confirmation_id"] != confirmation_id:
+                return JSONResponse({"error": "request_key already used"},
+                                    status_code=409)
+            # Recovery (Astra round-9 F3): a state left by the
+            # pre-fix implementation can pair this key's stored
+            # outcome with an earlier attempt's landed-but-
+            # rowless reservation. Fence and queue that orphan's
+            # release before answering — the fence is local and
+            # immediate; delivery belongs to maintenance, so the
+            # replay never waits on D-Planet (Astra round-10 F3).
+            # A no-op for every healthy key.
+            await asyncio.to_thread(
+                store.compensate_orphan_intent_for_key, owner, request_key)
+            return await replay_answer(existing)
         confirmation = await asyncio.to_thread(store.app_reading_confirmation,
                                                owner, confirmation_id)
         if confirmation is None:
@@ -564,26 +870,79 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                   "credits": current["credits"],
                   "price_version": current["price_version"]}
         try:
-            await asyncio.to_thread(
+            reserved = await asyncio.to_thread(
                 store.reserve_reading, owner, reading_id, confirmation_id,
                 request_key, credits=current["credits"],
                 price_version=current["price_version"], consent=record)
         except ReadingChargeError as charge_error:
+            if charge_error.code == "request_key_conflict":
+                return JSONResponse({"error": "request_key already used"},
+                                    status_code=409)
+            if charge_error.code in ("reading_pending",
+                                     "confirmation_already_used"):
+                # reading_pending (Astra round-1 F3): the remote
+                # reserve's outcome is ambiguous, but the reading row
+                # exists in 'reserved' state — answer with the stored
+                # row so the client polls its status under the same
+                # request key instead of buying again with a new one.
+                # confirmation_already_used (F6): a concurrent create
+                # consumed the confirmation — the winner's stored
+                # outcome is the answer, under the same identity
+                # check as a replay.
+                winner = await asyncio.to_thread(store.reading_by_request,
+                                                 owner, request_key)
+                if winner is None or winner["confirmation_id"] != confirmation_id:
+                    return JSONResponse({"error": "request_key already used"},
+                                        status_code=409)
+                return await replay_answer(winner)
             return JSONResponse({"error": charge_error.code}, status_code=400)
         except KeyError:
             return JSONResponse({"error": "Account not found"}, status_code=404)
+        except sqlite3.IntegrityError:
+            # A concurrent create with this request key won the
+            # insert (batch 2b item 9): answer with the stored
+            # outcome after the same identity check as a replay,
+            # never with an unhandled database error.
+            winner = await asyncio.to_thread(store.reading_by_request,
+                                             owner, request_key)
+            if winner is None or winner["confirmation_id"] != confirmation_id:
+                return JSONResponse({"error": "request_key already used"},
+                                    status_code=409)
+            return await replay_answer(winner)
+        if not reserved.get("created", True):
+            # The reservation already existed (Astra round-1 F6):
+            # only the creating caller generates. Everyone else gets
+            # the stored outcome — generating here could settle this
+            # caller's scan text into the first caller's reading, or
+            # release the first caller's reservation on failure.
+            return await replay_answer(reserved)
+        # The store may have adopted an earlier attempt's reading id
+        # for this request key (durable reservation intent, batch 2b
+        # item 1); settle/release always target the reserved row.
+        reading_id = reserved["id"]
         try:
-            generated = await asyncio.to_thread(reading_service.generate, scan)
+            # Async generation: the provider call is cancellable
+            # at the service deadline in every network phase
+            # (Astra round-4 F8), which a threaded sync call
+            # cannot guarantee during connection setup.
+            generated = await reading_service.generate_async(scan)
         except ReadingGenerationError as generation_error:
             await asyncio.to_thread(store.release_reading, owner, reading_id,
-                                    error_code=generation_error.code)
-            return JSONResponse({"error": generation_error.code}, status_code=400)
+                                    error_code=generation_error.code,
+                                    deliver=False)
+            # This call created the reading and the failure is
+            # terminal for it (released in full above): identify it
+            # as terminal, like a replayed stored failure (N8).
+            return JSONResponse({"error": generation_error.code,
+                                 "reading_id": reading_id, "state": "failed",
+                                 "terminal": True}, status_code=400)
         except Exception:
             # Any other generation failure still releases in full
             # before the error surfaces (design §4.1 step 5); the
             # orphan reconcile is only the backstop.
             await asyncio.to_thread(store.release_reading, owner, reading_id,
-                                    error_code="reading_unavailable")
+                                    error_code="reading_unavailable",
+                                    deliver=False)
             raise
         # If the parent scan's content expired mid-generation, the
         # text is delivered on this response only and not retained
@@ -673,8 +1032,39 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                 sessions.append({"job_id": row["job_id"],
                                  "operation": row["operation"],
                                  "state": row["state"], "cost": row["cost"],
+                                 "targets": row["targets"],
+                                 "intention": row["intention"],
+                                 "self_love_joy": row["self_love_joy"],
                                  "created_at": _iso(row["created_at"])})
         return JSONResponse({"sessions": sessions})
+
+    async def jobs_resume(request):
+        """Redeem a completion-mail resume token. The token is a
+        locator, not a credential: redemption requires the caller's
+        own authenticated session and returns only which job to
+        open. Unknown tokens answer 404 without revealing whether
+        the token ever existed; the job's data stays behind the
+        session exactly as everywhere else."""
+        if not enabled:
+            return denied()
+        owner, _token = await authenticate(request)
+        if owner is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body = await body_object(request)
+        if body is None:
+            return JSONResponse({"error": "JSON object required"}, status_code=400)
+        token_value = body.get("token")
+        if not isinstance(token_value, str) \
+                or not 16 <= len(token_value) <= 256:
+            return JSONResponse({"error": "resume_invalid"}, status_code=400)
+        try:
+            redeemed = await asyncio.to_thread(
+                store.redeem_resume_token, owner, token_value)
+        except ValueError:
+            return JSONResponse({"error": "resume_expired"}, status_code=400)
+        if redeemed is None:
+            return JSONResponse({"error": "resume_not_found"}, status_code=404)
+        return JSONResponse(redeemed)
 
     # --- Referral (referral-system-design-20261122) ---
     # Gated on the referral switch alone (not the app rollout
@@ -756,4 +1146,5 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             Route("/api/app/readings/{reading_id}", reading_get, methods=["GET"]),
             Route("/api/app/jobs/{job_id}", job_status, methods=["GET"]),
             Route("/api/app/jobs/{job_id}/cancel", job_cancel, methods=["POST"]),
+            Route("/api/app/resume", jobs_resume, methods=["POST"]),
             Route("/api/app/history", history, methods=["GET"])]

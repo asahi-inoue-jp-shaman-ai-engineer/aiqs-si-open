@@ -21,15 +21,33 @@ function factors(user) {
   }).sort((a, b) => a.id.localeCompare(b.id));
 }
 
-export function createExistingEntry({ auth, handoff }) {
+// Email OTP login discipline (2026-11-23): one issued code accepts a
+// bounded number of verification attempts, the sends per page session
+// are capped, and a resend must wait out a cooldown. These are
+// page-level brakes only; the provider's own code expiry and rate
+// limits remain the server-side authority.
+const OTP_CODE_ATTEMPTS = 5;
+const OTP_MAX_SENDS = 5;
+const OTP_RESEND_COOLDOWN_MS = 60000;
+
+export function createExistingEntry({ auth, handoff, resumeRegistration = null, otpLedger = null }) {
   if (!auth || typeof handoff !== 'function') throw failure();
+  if (resumeRegistration !== null && typeof resumeRegistration !== 'function') throw failure();
+  if (otpLedger !== null && (typeof otpLedger !== 'object' ||
+      !Number.isFinite(otpLedger.sends) || !Number.isFinite(otpLedger.lastSentAt))) throw failure();
+  // The send ledger is page-level accounting: the host may share one
+  // ledger across controller instances (mode switches rebuild the
+  // controller), so clear() must never reset it.
+  const ledger = otpLedger ?? { sends: 0, lastSentAt: 0 };
   let state = 'ready', busy = false, mode = null, email = null;
   let subject = null, token = null, roster = null, selected = null, challenge = null;
+  let otpAttempts = 0;
   const terminal = ['disposed', 'finished', 'restart-required', 'unsupported-factor', 'password-update-unknown'];
   function active() { if (terminal.includes(state)) throw failure(); }
   function clear() {
-    auth = null; handoff = null; email = null; token = null; subject = null;
+    auth = null; handoff = null; resumeRegistration = null; email = null; token = null; subject = null;
     roster = null; selected = null; challenge = null;
+    otpAttempts = 0;
   }
   function stop(next) { state = next; clear(); }
   async function run(allowed, action) {
@@ -62,6 +80,16 @@ export function createExistingEntry({ auth, handoff }) {
   async function finish() {
     await boundary();
     active();
+    // Authenticated resumption (A2, batch 2b item 11): when the
+    // host holds a durable pending SI registration for this exact
+    // user, it completes the registration BEFORE the handoff. A
+    // failure stops the handoff — the user is never presented as
+    // finished while their identity cannot be provisioned — and
+    // the durable record survives for the next login.
+    if (resumeRegistration) {
+      await resumeRegistration({ subject, token });
+      active();
+    }
     const send = handoff, credential = token;
     stop('finished'); // An ambiguous handoff cannot be repeated.
     await send(credential);
@@ -81,8 +109,38 @@ export function createExistingEntry({ auth, handoff }) {
     if (mode === 'recovery') { state = 'password-ready'; return { kind: 'password-ready' }; }
     return finish();
   }
+  // Centralized OTP dispatch accounting (Astra round-1 finding 3):
+  // the send is reserved and the cooldown starts BEFORE dispatch,
+  // so a request the provider accepted but whose response was lost
+  // still spends the send — the page-level budget bounds actual
+  // sends, not only acknowledged ones. The same gate serves the
+  // initial request and resends, so navigating back and forth
+  // cannot bypass the cooldown either.
+  async function dispatchOtp() {
+    if (ledger.sends >= OTP_MAX_SENDS) { stop('restart-required'); throw failure(); }
+    if (ledger.lastSentAt && Date.now() - ledger.lastSentAt < OTP_RESEND_COOLDOWN_MS) throw failure();
+    ledger.sends += 1; ledger.lastSentAt = Date.now();
+    let result;
+    try { result = await auth.signInWithOtp({ email, options: { shouldCreateUser: false } }); }
+    catch { result = null; }
+    active();
+    if (!result || result.error || !result.data) throw failure();
+    // Attempts reset only on acknowledged issuance: a rejected or
+    // ambiguous resend must not replenish guesses against the code
+    // that is still current (Astra round-2 finding N1).
+    otpAttempts = 0;
+  }
   return {
     get state() { return state; },
+    // Snapshot for the view's OTP guidance (attempts left on the
+    // current code, sends left in this page session, resend wait).
+    get otp() {
+      return Object.freeze({
+        attemptsLeft: OTP_CODE_ATTEMPTS - otpAttempts,
+        sendsLeft: OTP_MAX_SENDS - ledger.sends,
+        resendWaitMs: Math.max(0, ledger.lastSentAt + OTP_RESEND_COOLDOWN_MS - Date.now()),
+      });
+    },
     passwordLogin({ email: loginEmail, password }) {
       return run(['ready'], async () => {
         mode = 'login';
@@ -92,6 +150,74 @@ export function createExistingEntry({ auth, handoff }) {
           return await ready();
         } catch { if (!terminal.includes(state)) stop('restart-required'); throw failure(); }
         finally { password = null; loginEmail = null; }
+      });
+    },
+    // Email OTP login (2026-11-23): the primary sign-in for existing
+    // accounts. shouldCreateUser stays false, so an address without
+    // an account never mints a provider user here; registration is
+    // the separate signup flow with its SI marker and finalization.
+    // A failed request creates no session and pins no identity, so
+    // it returns to 'ready' and the address can be corrected in
+    // place; a failed verification likewise stays on the code step
+    // until the per-code attempt budget is spent.
+    requestOtpLogin(loginEmail) {
+      return run(['ready'], async () => {
+        if (typeof loginEmail !== 'string' || !loginEmail.trim()) throw failure();
+        mode = 'login'; email = loginEmail;
+        state = 'otp-sending';
+        // A failed request creates no session and pins no identity,
+        // so it returns to 'ready' and the address can be corrected
+        // in place (the send itself stays spent — see dispatchOtp).
+        try { await dispatchOtp(); }
+        catch { if (!terminal.includes(state)) state = 'ready'; throw failure(); }
+        state = 'otp-code';
+        return { kind: 'otp-code-required' };
+      });
+    },
+    verifyOtpLogin(code) {
+      return run(['otp-code'], async () => {
+        try {
+          if (typeof code !== 'string' || !/^[0-9]{6}$/.test(code)) throw failure();
+          let result;
+          try { result = await auth.verifyOtp({ email, token: code, type: 'email' }); }
+          catch { result = null; }
+          active();
+          if (!result || result.error || !result.data) {
+            // A rejected or unreachable verification spends one
+            // attempt on this code; a spent code returns the flow
+            // to 'ready', where a fresh code can be requested.
+            otpAttempts += 1;
+            if (otpAttempts >= OTP_CODE_ATTEMPTS) { otpAttempts = 0; state = 'ready'; }
+            throw failure();
+          }
+          // The code is consumed once verification succeeds; a
+          // failure in pin or the post-authentication boundaries
+          // cannot be retried with it, so it terminates exactly
+          // like the password path (Astra round-1 finding 2).
+          try {
+            pin(result);
+            email = null; otpAttempts = 0;
+            return await ready();
+          } catch { if (!terminal.includes(state)) stop('restart-required'); throw failure(); }
+        } finally { code = null; }
+      });
+    },
+    resendOtpLogin() {
+      return run(['otp-code'], async () => {
+        // A failed or ambiguous resend keeps the current code step
+        // and its remaining attempt budget: the previous (or
+        // just-dispatched) code may still arrive and be verified.
+        await dispatchOtp();
+        return { kind: 'otp-code-required' };
+      });
+    },
+    backToEmail() {
+      return run(['otp-code'], async () => {
+        // The send budget deliberately survives the trip back, so
+        // alternating request/back cannot mint unlimited sends.
+        email = null; otpAttempts = 0;
+        state = 'ready';
+        return { kind: 'email-required' };
       });
     },
     requestRecovery(originalEmail) {

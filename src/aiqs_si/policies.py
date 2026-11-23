@@ -10,6 +10,12 @@ errors name the offending KEY only, never the supplied value. With
 the env var unset, each loader returns the built-in defaults, which
 in this open-source tree are synthetic example values; production
 deployments supply their real values through the environment.
+The production entry point additionally runs
+policy_posture_problems() at startup so those defaults can never
+take effect silently in production: the money- and exposure-bearing
+policies must be set explicitly (an explicit null limit is an
+explicit choice), or the operator must acknowledge the defaults
+with AIQS_SI_ALLOW_DEFAULT_POLICIES=1.
 """
 import json
 import os
@@ -18,6 +24,7 @@ PRICING_POLICY_ENV = "AIQS_SI_PRICING_POLICY_JSON"
 GRANT_POLICY_ENV = "AIQS_SI_GRANT_POLICY_JSON"
 LIMIT_POLICY_ENV = "AIQS_SI_LIMIT_POLICY_JSON"
 EXECUTION_PROFILES_ENV = "AIQS_SI_CORE_EXECUTION_PROFILES_JSON"
+ALLOW_DEFAULT_POLICIES_ENV = "AIQS_SI_ALLOW_DEFAULT_POLICIES"
 
 
 class PolicyError(ValueError):
@@ -250,7 +257,14 @@ class LimitPolicy:
     """Scan exposure limits (plan v4 §9 R3-2) and the worker claim TTL
     (plan v4 §8). Quota/budget are None (dormant) until the operator
     sets approved numbers; the reservation ledger runs either way so
-    the accounting exists before enforcement is switched on."""
+    the accounting exists before enforcement is switched on.
+
+    Units: scan_daily_quota_per_account is a COUNT of scans per
+    account per day; scan_exposure_budget_total is in exposure units
+    (scan_units_per_job per scan). The field names are the deployed
+    env keys and stay stable; only the daily quota's counting basis
+    was corrected (it previously summed units, so a quota below the
+    per-scan unit cost rejected every scan)."""
 
     def __init__(self, *, scan_daily_quota_per_account, scan_exposure_budget_total,
                  scan_units_per_job, claim_ttl_seconds,
@@ -289,6 +303,72 @@ def load_limit_policy(environ=None):
                                minimum=60, maximum=86400, default=3600),
         reading_daily_cap_per_account=_optional_int(
             LIMIT_POLICY_ENV, obj, "reading_daily_cap_per_account", minimum=0))
+
+
+def policy_posture_problems(environ=None):
+    """Startup posture check (Astra final round #5): the money- and
+    exposure-bearing policies must be EXPLICIT in the deployment
+    env, so a missing or partial variable can never silently
+    substitute the built-in defaults in production.
+
+    Explicit includes an explicit null: a limit key set to null is
+    the operator's recorded choice of unlimited operation (with the
+    reservation ledger and monitoring running), not an omission.
+    The development/demo path stays available through the explicit
+    AIQS_SI_ALLOW_DEFAULT_POLICIES=1 acknowledgement, which accepts
+    the built-in defaults as a deliberate choice.
+
+    Returns a list of human-readable problems naming env vars and
+    keys only — never values. An empty list means the posture is
+    explicit. The loaders themselves are unchanged: their defaults
+    remain the historical values for tests and demo use.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get(ALLOW_DEFAULT_POLICIES_ENV) == "1":
+        return []
+    problems = []
+
+    def parsed(env_name):
+        try:
+            return _load_object(environ, env_name)
+        except PolicyError:
+            problems.append(f"{env_name}: set but not a valid JSON object")
+            return "invalid"
+
+    pricing = parsed(PRICING_POLICY_ENV)
+    if pricing is None:
+        problems.append(
+            f"{PRICING_POLICY_ENV}: not set; built-in default prices "
+            "would apply silently")
+    elif pricing != "invalid" and not (
+            "credits_per_shot_tenths" in pricing or "credits_per_shot" in pricing):
+        problems.append(
+            f"{PRICING_POLICY_ENV}: does not set a shot rate "
+            "('credits_per_shot_tenths'); the default rate would apply silently")
+
+    grant = parsed(GRANT_POLICY_ENV)
+    if grant is None:
+        problems.append(
+            f"{GRANT_POLICY_ENV}: not set; built-in default grant "
+            "amounts would apply silently")
+    elif grant != "invalid" and "referral_credits" not in grant:
+        problems.append(
+            f"{GRANT_POLICY_ENV}: does not set 'referral_credits'; "
+            "the default grant amount would apply silently")
+
+    limit = parsed(LIMIT_POLICY_ENV)
+    if limit is None:
+        problems.append(
+            f"{LIMIT_POLICY_ENV}: not set; built-in default limits "
+            "(unlimited) would apply silently")
+    elif limit != "invalid":
+        for key in ("scan_daily_quota_per_account",
+                    "scan_exposure_budget_total"):
+            if key not in limit:
+                problems.append(
+                    f"{LIMIT_POLICY_ENV}: does not set {key!r}; set a "
+                    "number or an explicit null (unlimited, monitored)")
+    return problems
 
 
 _PROFILE_KEYS = {"cycles", "top_mfs", "top_entries", "qrs_threshold",

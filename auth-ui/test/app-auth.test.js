@@ -197,3 +197,151 @@ test('an expired access token is refreshed once', async () => {
   assert.equal(await auth.getToken(), 'a2');
   assert.deepEqual(grants, ['authorization_code', 'refresh_token']);
 });
+
+test('takeFragment adopts only a state-bound handoff token', async () => {
+  const { auth, items, location } = fixture({ responder: () => tokenResponse({}) });
+  // Unsolicited: no state at all (the Astra attack shape).
+  location.hash = '#access_token=ATTACKER';
+  assert.equal(auth.takeFragment(), false);
+  assert.equal(await auth.getToken(), null);
+  // The nonce this browser armed at construction is the only key.
+  const state = items.get('si-fragment-handoff-v1');
+  assert.ok(state);
+  location.hash = `#access_token=handed-over&state=${state}`;
+  assert.equal(auth.takeFragment(), true);
+  assert.equal(await auth.getToken(), 'handed-over');
+  // Consumed: the same link cannot be replayed.
+  location.hash = `#access_token=handed-over&state=${state}`;
+  assert.equal(auth.takeFragment(), false);
+});
+
+test('a fragment adoption clears a persisted session from another account', async () => {
+  const { make, session, persistent, location } = persistentFixture({
+    responder: () => tokenResponse({}),
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'someone-elses', savedAt: 1 }));
+  const auth = make();
+  const state = session.get('si-fragment-handoff-v1');
+  assert.ok(state);
+  location.hash = `#access_token=mine-now&state=${state}`;
+  assert.equal(auth.takeFragment(), true);
+  assert.equal(await auth.getToken(), 'mine-now');
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  assert.equal(auth.hasPersistedSession(), false);
+});
+
+test('a delayed refresh cannot resurrect the previous account after a handoff', async () => {
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, session, persistent, location } = persistentFixture({
+    responder: async (url, options) => {
+      const grant = new URLSearchParams(options.body).get('grant_type');
+      if (grant === 'refresh_token') {
+        await gate;
+        return tokenResponse({
+          access_token: 'a-access-2', refresh_token: 'a-refresh-2', expires_in: 3600,
+        });
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'a-refresh-1', savedAt: 1 }));
+  const auth = make();
+  const pending = auth.getToken(); // starts account A's refresh
+  // While it is in flight, a state-bound handoff for account B lands.
+  const state = session.get('si-fragment-handoff-v1');
+  assert.ok(state);
+  location.hash = '#' + new URLSearchParams({ access_token: 'b-access', state }).toString();
+  assert.equal(auth.takeFragment(), true);
+  assert.equal(await auth.getToken(), 'b-access');
+  releaseRefresh();
+  // A's late response is discarded by the generation check: the
+  // session stays B's, in memory only, with nothing persisted.
+  assert.equal(await pending, 'b-access');
+  assert.equal(await auth.getToken(), 'b-access');
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  assert.equal(auth.hasPersistedSession(), false);
+});
+
+test('a stale rejection cannot clear the session a handoff just created', async () => {
+  // Astra diff review round 2 (Item 1, MEDIUM): the refresh for
+  // account A is in flight; its 'rejected' outcome is produced
+  // while a state-bound handoff for account B lands before the
+  // refresh continuation interprets the outcome. The continuation
+  // re-checks the authentication generation and touches nothing.
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, session, persistent, location } = persistentFixture({
+    responder: async (url, options) => {
+      const grant = new URLSearchParams(options.body).get('grant_type');
+      if (grant === 'refresh_token') {
+        await gate;
+        return { ok: false, status: 400, json: async () => ({ error: 'invalid_grant' }) };
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'a-refresh-1', savedAt: 1 }));
+  const auth = make();
+  const pending = auth.getToken(); // starts account A's refresh
+  releaseRefresh();
+  // Let the token request settle, then adopt B's handoff before
+  // the pending getToken() settles.
+  await Promise.resolve();
+  const state = session.get('si-fragment-handoff-v1');
+  assert.ok(state);
+  location.hash = '#' + new URLSearchParams({ access_token: 'b-access', state }).toString();
+  assert.equal(auth.takeFragment(), true);
+  assert.equal(await pending, 'b-access');
+  assert.equal(await auth.getToken(), 'b-access');
+  assert.equal(persistent.has('si-app-session-v1'), false);
+});
+
+test('a generation change during a deferred response body still discards the old account', async () => {
+  // Pins the generation check AFTER response.json() resolves
+  // (Astra delta review): the refresh response headers arrive,
+  // a state-bound handoff for account B lands, and only THEN
+  // does account A's body finish parsing. Deleting the post-
+  // json() generation check makes this test fail — A's tokens
+  // would be adopted and persisted underneath B's session.
+  let releaseBody;
+  let bodyRequested;
+  const bodyGate = new Promise((resolve) => { releaseBody = resolve; });
+  const bodyCalled = new Promise((resolve) => { bodyRequested = resolve; });
+  const { make, session, persistent, location } = persistentFixture({
+    responder: async (url, options) => {
+      const grant = new URLSearchParams(options.body).get('grant_type');
+      if (grant === 'refresh_token') {
+        return {
+          ok: true, status: 200,
+          json: async () => {
+            bodyRequested();
+            await bodyGate;
+            return {
+              access_token: 'a-access-2', refresh_token: 'a-refresh-2', expires_in: 3600,
+            };
+          },
+        };
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'a-refresh-1', savedAt: 1 }));
+  const auth = make();
+  const pending = auth.getToken(); // starts account A's refresh
+  await bodyCalled; // A's response is now mid-parse
+  const state = session.get('si-fragment-handoff-v1');
+  assert.ok(state);
+  location.hash = '#' + new URLSearchParams({ access_token: 'b-access', state }).toString();
+  assert.equal(auth.takeFragment(), true);
+  releaseBody();
+  assert.equal(await pending, 'b-access');
+  assert.equal(await auth.getToken(), 'b-access');
+  // A's rotated refresh token was never persisted under B.
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  assert.equal(auth.hasPersistedSession(), false);
+});
