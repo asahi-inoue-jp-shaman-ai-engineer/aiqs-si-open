@@ -404,66 +404,56 @@ const CARRY_KEY = 'si-fragment-handoff-carry-v1';
 // under the clear tombstone its adoption had written (Astra
 // batch2f diff review, R1 app-side variant).
 //
+// Batch 2h (Astra batch2g diff review, F2): the snapshot and
+// the carry binding are now projections of ONE derivation —
+// deriveSharedState below — not two judgment paths that
+// happen to share parsing helpers. They used to be free to
+// disagree, and did, on exactly one shape: a legacy session
+// record (no rev, no sid of its own) whose epoch companion
+// is ABSENT. The derivation now decides that shape once
+// (see the deferral branch): a valid unnamed session, which
+// this projection reports with rev and sid null, and which
+// names no carry binding, so the binding projection is null
+// for it and carries refuse it. The difference between the
+// projections is a difference of question — what session is
+// held vs what binding can be named — decided in one place,
+// not a difference of judgment about the bytes. The
+// derivation also reports `unnamed`: whether
+// a session record carries neither revision nor lineage of
+// its own (its revision, when one exists, is deferred to
+// the epoch record). Consumers judge record-shape questions
+// by that flag, never by the derived revision — a deferred
+// revision is non-null, and judging by it let such records
+// slip past the access-only naming in app-auth.js and stay
+// unnamed forever (F4).
+//
 // Returns null when there is no persistent storage at all.
 // Otherwise one of:
 // - { state: 'absent' } — confirmed: neither key holds a
 //   record.
 // - { state: 'unverifiable' } — a present record cannot be
 //   read back, or its shape is one the protocol never writes.
-// - { state: 'record', refreshToken, rev, sid } — the session
-//   record's token (null when only a clear tombstone exists),
-//   the revision the state attests, and its lineage. A session
-//   record carrying a lineage reports that lineage and its
-//   OWN revision (never the epoch's); the epoch record
-//   supplies the revision only for a legacy session record
-//   carrying neither field — the same deferral as the
-//   verified binding. One deliberate projection difference:
-//   such a legacy record whose epoch companion is ABSENT
-//   still reports here, with rev and sid null (the verified
-//   binding names no binding for it): the app holds that very
-//   token, binds to the unnamed state, and any later write
-//   moves the snapshot away from the binding; the first
-//   successful refresh re-persists the record in the atomic
-//   shape, after which disappearance and corruption
-//   invalidate like any established record.
+// - { state: 'record', refreshToken, rev, sid, unnamed } —
+//   the session record's token (null when only a clear
+//   tombstone exists), the revision the state attests, and
+//   its lineage. A session record carrying a lineage reports
+//   that lineage and its OWN revision (never the epoch's);
+//   the epoch record supplies the revision only for a legacy
+//   session record carrying neither field — the same
+//   deferral as the verified binding.
 export function verifiedSharedSessionSnapshot(persistentStorage) {
   if (!persistentStorage) return null;
-  const session = readSharedRecord(persistentStorage, SHARED_SESSION_KEY);
-  if (session.state === 'unreadable') return { state: 'unverifiable' };
-  if (session.state === 'record') {
-    const binding = sessionRecordBinding(session.record);
-    if (binding === null) return { state: 'unverifiable' };
-    if (binding === 'epoch') {
-      const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
-      if (epoch.state === 'unreadable') return { state: 'unverifiable' };
-      if (epoch.state === 'absent') {
-        return {
-          state: 'record', refreshToken: session.record.refreshToken,
-          rev: null, sid: null,
-        };
-      }
-      const rev = epochRecordRevision(epoch.record);
-      if (rev === null) return { state: 'unverifiable' };
-      return {
-        state: 'record', refreshToken: session.record.refreshToken,
-        rev, sid: null,
-      };
-    }
-    return {
-      state: 'record',
-      refreshToken: session.record.refreshToken,
-      rev: isNonEmptyString(session.record.rev) ? session.record.rev : null,
-      sid: binding.sid ?? null,
-    };
+  const derived = deriveSharedState(persistentStorage);
+  if (derived.classification === 'absent') return { state: 'absent' };
+  if (derived.classification === 'unverifiable') {
+    return { state: 'unverifiable' };
   }
-  const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
-  if (epoch.state === 'unreadable') return { state: 'unverifiable' };
-  if (epoch.state === 'absent') return { state: 'absent' };
-  const rev = epochRecordRevision(epoch.record);
-  if (rev === null) return { state: 'unverifiable' };
   return {
-    state: 'record', refreshToken: null, rev,
-    sid: isNonEmptyString(epoch.record.sid) ? epoch.record.sid : null,
+    state: 'record',
+    refreshToken: derived.refreshToken,
+    rev: derived.rev,
+    sid: derived.sid,
+    unnamed: derived.unnamed,
   };
 }
 
@@ -566,15 +556,122 @@ function epochRecordRevision(record) {
   return `legacy:${record.epoch}`;
 }
 
+// THE derivation of the shared state (batch 2h, F2): every
+// surface's view of the shared session — the carry binding
+// and the app snapshot alike — is a projection of this one
+// classification, computed by this one judgment path. Batch
+// 2g left the binding and the snapshot as separate paths
+// that shared parsing helpers and still disagreed on the
+// legacy shape below; two paths that CAN disagree eventually
+// do, and the disagreement is itself the defect.
+//
+// Returns one of:
+// - { classification: 'absent' } — confirmed: neither key
+//   holds a record.
+// - { classification: 'unverifiable' } — a present record
+//   cannot be read back, or its shape is one the protocol
+//   never writes.
+// - { classification: 'record', refreshToken, rev, sid,
+//   binding, unnamed } — the session record's token (null
+//   when only a clear tombstone exists), the revision the
+//   state attests, its lineage, the carry binding the state
+//   names (null for exactly one shape: the unnamed legacy
+//   session without its epoch companion, which names no
+//   binding — see the deferral branch), and whether a
+//   session record carries neither revision nor lineage of
+//   its own.
+function deriveSharedState(persistentStorage) {
+  const session = readSharedRecord(persistentStorage, SHARED_SESSION_KEY);
+  if (session.state === 'unreadable') {
+    return { classification: 'unverifiable' };
+  }
+  if (session.state === 'record') {
+    const binding = sessionRecordBinding(session.record);
+    if (binding === null) return { classification: 'unverifiable' };
+    if (binding === 'epoch') {
+      // A valid legacy session whose revision, if any, lives
+      // in the epoch record. A companion that is present but
+      // malformed leaves the state unverifiable: it spoke,
+      // and what it said cannot be trusted. A companion that
+      // is ABSENT is the one shape the two projections answer
+      // differently — by design, and decided HERE, once
+      // (batch 2h, F2): the record is a valid unnamed session
+      // (it dates from the first persistent-session release,
+      // which wrote the session record before the epoch
+      // record existed), and the app — which holds that very
+      // token and fences it by whole identity, token value
+      // included — loads it and names it at the first
+      // rotation. But the state names NO carry binding: a
+      // carry cannot name a lineage that does not exist, and
+      // the account surface, which holds only a fragment
+      // token and a binding claim, cannot fence an unnamed
+      // record by value the way the app can — so the binding
+      // projection is null for this shape, and carries refuse
+      // it exactly as they refuse the unverifiable. The
+      // projections differ because they answer different
+      // questions (what session is held vs what binding can
+      // be named), never because they judge the bytes
+      // differently. When the companion speaks, the binding
+      // is the epoch's REVISION, never its sid (see
+      // epochRecordRevision).
+      const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
+      if (epoch.state === 'unreadable') {
+        return { classification: 'unverifiable' };
+      }
+      if (epoch.state === 'absent') {
+        return {
+          classification: 'record',
+          refreshToken: session.record.refreshToken,
+          rev: null, sid: null, binding: null, unnamed: true,
+        };
+      }
+      const rev = epochRecordRevision(epoch.record);
+      if (rev === null) return { classification: 'unverifiable' };
+      return {
+        classification: 'record',
+        refreshToken: session.record.refreshToken,
+        rev, sid: null, binding: { rev }, unnamed: true,
+      };
+    }
+    return {
+      classification: 'record',
+      refreshToken: session.record.refreshToken,
+      rev: isNonEmptyString(session.record.rev) ? session.record.rev : null,
+      sid: binding.sid ?? null,
+      binding, unnamed: false,
+    };
+  }
+  const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
+  if (epoch.state === 'unreadable') {
+    return { classification: 'unverifiable' };
+  }
+  if (epoch.state === 'absent') return { classification: 'absent' };
+  const binding = epochRecordBinding(epoch.record);
+  if (binding === null) return { classification: 'unverifiable' };
+  return {
+    classification: 'record',
+    refreshToken: null,
+    rev: epochRecordRevision(epoch.record),
+    sid: isNonEmptyString(epoch.record.sid) ? epoch.record.sid : null,
+    binding, unnamed: false,
+  };
+}
+
 // The current shared binding, VERIFIED (batch 2e round 4, R1;
-// shapes hardened in batch 2f): the one derivation of the
-// shared state — every surface reads it here or through its
-// projections (batch 2g removed the lenient twin) — and a
-// state that cannot be read back —
-// a throwing read, an unparseable value, or a present record
-// whose shape the protocol never writes ({} / [] / a session
-// record with no usable refresh token) — yields null
-// (UNVERIFIABLE) instead of collapsing into 'none'. 'none'
+// shapes hardened in batch 2f): the binding projection of the
+// one derivation of the shared state (deriveSharedState —
+// batch 2h made the projection literal: every surface reads
+// the state there or through its projections, and batch 2g
+// removed the lenient twin). A state that cannot be read
+// back — a throwing read, an unparseable value, or a present
+// record whose shape the protocol never writes ({} / [] / a
+// session record with no usable refresh token) — yields null
+// (UNVERIFIABLE) instead of collapsing into 'none'. Null is
+// also the projection for the one verifiable record that
+// names no binding — the unnamed legacy session without its
+// epoch companion (batch 2h, F2; the decision and its
+// rationale live in deriveSharedState) — and consumers
+// refuse both, since neither can be bound to a carry. 'none'
 // from this function means CONFIRMED absence: both keys the
 // binding could ride on were read and held no record. The
 // destination must refuse a carried handoff whose current
@@ -584,26 +681,10 @@ function epochRecordRevision(record) {
 // lineage by a second read.
 export function verifiedSharedCarryBinding(persistentStorage) {
   if (!persistentStorage) return null;
-  const session = readSharedRecord(persistentStorage, SHARED_SESSION_KEY);
-  if (session.state === 'unreadable') return null;
-  if (session.state === 'record') {
-    const binding = sessionRecordBinding(session.record);
-    if (binding === null) return null;
-    if (binding !== 'epoch') return binding;
-    // A valid legacy session whose revision lives in the
-    // epoch record: the epoch record must speak, and speak
-    // validly — the session exists, so 'none' is impossible.
-    // The binding is the epoch's REVISION, never its sid
-    // (see epochRecordRevision).
-    const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
-    if (epoch.state !== 'record') return null;
-    const rev = epochRecordRevision(epoch.record);
-    return rev === null ? null : { rev };
-  }
-  const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
-  if (epoch.state === 'unreadable') return null;
-  if (epoch.state === 'absent') return 'none';
-  return epochRecordBinding(epoch.record);
+  const derived = deriveSharedState(persistentStorage);
+  if (derived.classification === 'absent') return 'none';
+  if (derived.classification === 'unverifiable') return null;
+  return derived.binding;
 }
 
 // The binding the carrying side writes under (batch 2f): the

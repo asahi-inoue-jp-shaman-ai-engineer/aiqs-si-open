@@ -98,6 +98,28 @@
 //   same-owner exemption: an older tombstone of this very
 //   instance must not stand in for a session record that has
 //   since disappeared.
+//
+// Batch 2h (Astra batch2g diff review, F1/F3/F4):
+// - The supersession fence's token clause is unconditional:
+//   a fragment session holds no refresh token, and comparing
+//   only when one was held let a session record that copied
+//   the adoption tombstone's rev/sid — with any refresh token
+//   of its own — pass the fence while the fragment token kept
+//   being served (F1). The shared state must still be exactly
+//   the tombstone (snapshot token null) for a fragment token
+//   to be served.
+// - Commits verify themselves: persistRefreshToken and the
+//   clear tombstone read their write back, so a storage whose
+//   setItem silently does nothing cannot report a landed
+//   commit (F3).
+// - The access-only naming judges "unnamed" by the session
+//   record's OWN fields (the snapshot's flag), not by the
+//   derived revision: a legacy record with an epoch companion
+//   derives a non-null revision and used to slip past the
+//   naming and stay unnamed forever (F4). The companion fix
+//   on the derivation side (F2 — the snapshot and the carry
+//   binding are projections of one derivation) lives in
+//   account-session.js.
 import {
   ensureFragmentHandoff, takeFragmentToken, verifiedSharedSessionSnapshot,
 } from './account-session.js';
@@ -243,16 +265,26 @@ export function createAppAuth({
   // ONE setItem. Returns the new revision, or null when the
   // write failed — callers that establish a session must treat
   // null as an aborted adoption, never as a degraded success.
+  // The write is verified by reading it back (batch 2h, F3):
+  // a storage whose setItem silently does nothing — it
+  // neither throws nor stores, as some blocked or quota-shed
+  // stores do — must not report a landed commit. Without the
+  // read-back, an adoption built on such a write "succeeded"
+  // here while nothing was persisted and every other tab kept
+  // dispatching the old session. A read-back that throws, or
+  // returns anything but the exact bytes written, is a failed
+  // commit.
   function persistRefreshToken(token, sid) {
     if (!persistentStorage || !token) return null;
     const rev = freshRevision();
+    const serialized = JSON.stringify({
+      refreshToken: token, rev, owner: instanceId, sid,
+      savedAt: Date.now(),
+    });
     let landed = false;
     try {
-      persistentStorage.setItem(SESSION_KEY, JSON.stringify({
-        refreshToken: token, rev, owner: instanceId, sid,
-        savedAt: Date.now(),
-      }));
-      landed = true;
+      persistentStorage.setItem(SESSION_KEY, serialized);
+      landed = persistentStorage.getItem(SESSION_KEY) === serialized;
     } catch { /* storage full/blocked: the commit did not happen */ }
     if (!landed) return null;
     boundRevision = rev;
@@ -317,12 +349,19 @@ export function createAppAuth({
     try { persistentStorage.removeItem(SESSION_KEY); } catch { /* the probe below decides */ }
     const rev = freshRevision();
     const sid = freshRevision();
+    const serialized = JSON.stringify({
+      rev, owner: instanceId, kind: 'clear', sid, at: Date.now(),
+    });
     let landed = false;
     try {
-      persistentStorage.setItem(EPOCH_KEY, JSON.stringify({
-        rev, owner: instanceId, kind: 'clear', sid, at: Date.now(),
-      }));
-      landed = true;
+      persistentStorage.setItem(EPOCH_KEY, serialized);
+      // The tombstone is a commit too (batch 2h, F3): verify
+      // the write landed by reading it back, exactly as
+      // persistRefreshToken does — a silently ignored write
+      // would otherwise report a committed clear while no
+      // tombstone exists, and bind new credentials to a
+      // revision no record attests.
+      landed = persistentStorage.getItem(EPOCH_KEY) === serialized;
     } catch { /* no fresh tombstone: the clear did not commit */ }
     if (!landed) {
       dropInMemorySession();
@@ -374,15 +413,26 @@ export function createAppAuth({
       return boundRevision !== null || boundSid !== null;
     }
     // The token itself is part of the comparison (batch 2g
-    // round 2): two UNNAMED records share the (null, null)
-    // binding, so binding alone cannot tell this instance's
-    // legacy session from a foreign legacy record that
-    // replaced it — the token value can, and this instance
-    // holds it. For named records the clause never fires on
-    // protocol writes (token and revision move together in
-    // one commit); it fires exactly on foreign replacement.
+    // round 2; unconditional since batch 2h, F1): two UNNAMED
+    // records share the (null, null) binding, so binding alone
+    // cannot tell this instance's legacy session from a
+    // foreign legacy record that replaced it — the token value
+    // can, and this instance holds it. For named records the
+    // clause never fires on protocol writes (token and
+    // revision move together in one commit); it fires exactly
+    // on foreign replacement. The clause must ALSO fire when
+    // this instance holds no refresh token at all — a fragment
+    // session: its adoption cleared the shared state and bound
+    // the token to the clear tombstone, whose snapshot token
+    // is null, so the shared state must STILL be exactly that
+    // tombstone for the fragment token to be served. Comparing
+    // only when a token was held left the tombstone's rev/sid
+    // borrowable: a session record copying both, with any
+    // refresh token of its own, passed this fence and the
+    // fragment token kept being served under a session record
+    // it never belonged to (Astra batch2g diff review, F1).
     return snap.rev !== boundRevision || snap.sid !== boundSid
-      || (refreshToken !== null && snap.refreshToken !== refreshToken);
+      || snap.refreshToken !== refreshToken;
   }
 
   function dropInMemorySession() {
@@ -435,9 +485,15 @@ export function createAppAuth({
       // Leaving it unnamed would keep two different legacy
       // sessions indistinguishable to the binding checks. A
       // failed naming commit aborts the adoption like any
-      // other failed commit.
+      // other failed commit. "Unnamed" is judged by the
+      // RECORD's own fields — the snapshot's `unnamed` flag —
+      // never by the derived revision (batch 2h, F4): a legacy
+      // record whose epoch companion exists derives a non-null
+      // revision, and the round-2 condition (derived rev and
+      // sid both null) let exactly those records slip past
+      // and stay unnamed forever.
       const snap = sharedSnapshot();
-      if (snap.state === 'record' && snap.rev === null && snap.sid === null
+      if (snap.state === 'record' && snap.unnamed
         && snap.refreshToken === refreshToken) {
         if (!persistRefreshToken(refreshToken, freshRevision())) return false;
       }

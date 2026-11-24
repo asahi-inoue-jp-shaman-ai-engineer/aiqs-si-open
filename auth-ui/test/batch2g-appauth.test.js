@@ -158,23 +158,45 @@ test('batch2g snapshot: classification matches the verified derivation', () => {
     [EPOCH_KEY]: JSON.stringify({
       rev: 'rev-tomb', owner: 'tab-a', kind: 'clear', sid: 'sid-a', at: 1,
     }),
-  })), { state: 'record', refreshToken: 'refresh-B', rev: null, sid: 'sid-B' });
-  // A legacy session record defers its revision to the epoch.
+  })), {
+    state: 'record', refreshToken: 'refresh-B', rev: null, sid: 'sid-B',
+    unnamed: false,
+  });
+  // A legacy session record defers its revision to the epoch,
+  // and reports itself unnamed: the record's OWN fields carry
+  // neither revision nor lineage (batch 2h, F4).
   assert.deepEqual(verifiedSharedSessionSnapshot(store({
     [SESSION_KEY]: JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }),
     [EPOCH_KEY]: JSON.stringify({ rev: 'rev-e', owner: 'tab-a', sid: 'sid-e' }),
-  })), { state: 'record', refreshToken: 'refresh-a1', rev: 'rev-e', sid: null });
-  // ... and still reports (unnamed) when the epoch companion
-  // is absent — the app's migration shape.
+  })), {
+    state: 'record', refreshToken: 'refresh-a1', rev: 'rev-e', sid: null,
+    unnamed: true,
+  });
+  // ... and with the epoch companion ABSENT the same record
+  // still reports, unnamed (batch 2h, F2): the snapshot and
+  // the carry binding are projections of one derivation, and
+  // the derivation decides this shape once — a valid unnamed
+  // session for the app (which fences it by token value),
+  // naming no carry binding (the binding projection is null
+  // for it, so the account surface refuses to carry under
+  // it). What batch 2h removed is the second judgment path
+  // that could classify the bytes differently, not the
+  // classification.
   assert.deepEqual(verifiedSharedSessionSnapshot(store({
     [SESSION_KEY]: JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }),
-  })), { state: 'record', refreshToken: 'refresh-a1', rev: null, sid: null });
+  })), {
+    state: 'record', refreshToken: 'refresh-a1', rev: null, sid: null,
+    unnamed: true,
+  });
   // A tombstone alone reports its revision and lineage.
   assert.deepEqual(verifiedSharedSessionSnapshot(store({
     [EPOCH_KEY]: JSON.stringify({
       rev: 'rev-tomb', owner: 'tab-a', kind: 'clear', sid: 'sid-a', at: 1,
     }),
-  })), { state: 'record', refreshToken: null, rev: 'rev-tomb', sid: 'sid-a' });
+  })), {
+    state: 'record', refreshToken: null, rev: 'rev-tomb', sid: 'sid-a',
+    unnamed: false,
+  });
   // No storage at all: no snapshot exists.
   assert.equal(verifiedSharedSessionSnapshot(null), null);
 });
