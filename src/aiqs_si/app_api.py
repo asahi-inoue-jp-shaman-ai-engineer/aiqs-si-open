@@ -999,109 +999,126 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         scan, error = await validated_scan(owner, confirmation["scan_id"])
         if error is not None:
             return error
-        reading_id = str(uuid.uuid4())
-        record = {"owner": owner, "subject": token.subject,
-                  "client_id": token.client_id,
-                  "confirmation_id": confirmation_id,
-                  "consented_at": _iso(time.time()), "operation": "reading",
-                  "credits": current["credits"],
-                  "price_version": current["price_version"]}
+        # Reading pool gate (batch 2e, R2): the admission
+        # middleware installed a gate in the scope; it is
+        # acquired only now — the caller is authenticated, the
+        # request validated, generation next. A full pool
+        # refuses BEFORE any reservation exists, so the client
+        # may retry under the same request key. Compositions
+        # without the middleware (direct app tests) carry no
+        # gate and run as before.
+        gate = request.scope.get("aiqs_si.reading_gate")
+        gate_lease = await gate.acquire() if gate is not None else None
+        if gate is not None and gate_lease is None:
+            return JSONResponse({"error": "server_busy"}, status_code=503,
+                                headers={"Retry-After": "1"})
         try:
-            reserved = await asyncio.to_thread(
-                store.reserve_reading, owner, reading_id, confirmation_id,
-                request_key, credits=current["credits"],
-                price_version=current["price_version"], consent=record)
-        except ReadingChargeError as charge_error:
-            if charge_error.code == "request_key_conflict":
-                return JSONResponse({"error": "request_key already used"},
-                                    status_code=409)
-            if charge_error.code in ("reading_pending",
-                                     "confirmation_already_used"):
-                # reading_pending (Astra round-1 F3): the remote
-                # reserve's outcome is ambiguous, but the reading row
-                # exists in 'reserved' state — answer with the stored
-                # row so the client polls its status under the same
-                # request key instead of buying again with a new one.
-                # confirmation_already_used (F6): a concurrent create
-                # consumed the confirmation — the winner's stored
-                # outcome is the answer, under the same identity
-                # check as a replay.
+            reading_id = str(uuid.uuid4())
+            record = {"owner": owner, "subject": token.subject,
+                      "client_id": token.client_id,
+                      "confirmation_id": confirmation_id,
+                      "consented_at": _iso(time.time()), "operation": "reading",
+                      "credits": current["credits"],
+                      "price_version": current["price_version"]}
+            try:
+                reserved = await asyncio.to_thread(
+                    store.reserve_reading, owner, reading_id, confirmation_id,
+                    request_key, credits=current["credits"],
+                    price_version=current["price_version"], consent=record)
+            except ReadingChargeError as charge_error:
+                if charge_error.code == "request_key_conflict":
+                    return JSONResponse({"error": "request_key already used"},
+                                        status_code=409)
+                if charge_error.code in ("reading_pending",
+                                         "confirmation_already_used"):
+                    # reading_pending (Astra round-1 F3): the remote
+                    # reserve's outcome is ambiguous, but the reading row
+                    # exists in 'reserved' state — answer with the stored
+                    # row so the client polls its status under the same
+                    # request key instead of buying again with a new one.
+                    # confirmation_already_used (F6): a concurrent create
+                    # consumed the confirmation — the winner's stored
+                    # outcome is the answer, under the same identity
+                    # check as a replay.
+                    winner = await asyncio.to_thread(store.reading_by_request,
+                                                     owner, request_key)
+                    if winner is None or winner["confirmation_id"] != confirmation_id:
+                        return JSONResponse({"error": "request_key already used"},
+                                            status_code=409)
+                    return await replay_answer(winner)
+                return JSONResponse({"error": charge_error.code}, status_code=400)
+            except KeyError:
+                return JSONResponse({"error": "Account not found"}, status_code=404)
+            except sqlite3.IntegrityError:
+                # A concurrent create with this request key won the
+                # insert (batch 2b item 9): answer with the stored
+                # outcome after the same identity check as a replay,
+                # never with an unhandled database error.
                 winner = await asyncio.to_thread(store.reading_by_request,
                                                  owner, request_key)
                 if winner is None or winner["confirmation_id"] != confirmation_id:
                     return JSONResponse({"error": "request_key already used"},
                                         status_code=409)
                 return await replay_answer(winner)
-            return JSONResponse({"error": charge_error.code}, status_code=400)
-        except KeyError:
-            return JSONResponse({"error": "Account not found"}, status_code=404)
-        except sqlite3.IntegrityError:
-            # A concurrent create with this request key won the
-            # insert (batch 2b item 9): answer with the stored
-            # outcome after the same identity check as a replay,
-            # never with an unhandled database error.
-            winner = await asyncio.to_thread(store.reading_by_request,
-                                             owner, request_key)
-            if winner is None or winner["confirmation_id"] != confirmation_id:
-                return JSONResponse({"error": "request_key already used"},
-                                    status_code=409)
-            return await replay_answer(winner)
-        if not reserved.get("created", True):
-            # The reservation already existed (Astra round-1 F6):
-            # only the creating caller generates. Everyone else gets
-            # the stored outcome — generating here could settle this
-            # caller's scan text into the first caller's reading, or
-            # release the first caller's reservation on failure.
-            return await replay_answer(reserved)
-        # The store may have adopted an earlier attempt's reading id
-        # for this request key (durable reservation intent, batch 2b
-        # item 1); settle/release always target the reserved row.
-        reading_id = reserved["id"]
-        try:
-            # Async generation: the provider call is cancellable
-            # at the service deadline in every network phase
-            # (Astra round-4 F8), which a threaded sync call
-            # cannot guarantee during connection setup.
-            generated = await reading_service.generate_async(scan)
-        except ReadingGenerationError as generation_error:
-            await asyncio.to_thread(store.release_reading, owner, reading_id,
-                                    error_code=generation_error.code,
-                                    deliver=False)
-            # This call created the reading and the failure is
-            # terminal for it (released in full above): identify it
-            # as terminal, like a replayed stored failure (N8).
-            return JSONResponse({"error": generation_error.code,
-                                 "reading_id": reading_id, "state": "failed",
-                                 "terminal": True}, status_code=400)
-        except Exception:
-            # Any other generation failure still releases in full
-            # before the error surfaces (design §4.1 step 5); the
-            # orphan reconcile is only the backstop.
-            await asyncio.to_thread(store.release_reading, owner, reading_id,
-                                    error_code="reading_unavailable",
-                                    deliver=False)
-            raise
-        # If the parent scan's content expired mid-generation, the
-        # text is delivered on this response only and not retained
-        # (its lifetime follows the scan's, design §3.5).
-        try:
-            fresh = await asyncio.to_thread(store.get, owner, confirmation["scan_id"])
-            retain = not fresh["payload"].get("content_removed")
-        except KeyError:
-            retain = False
-        settled = await asyncio.to_thread(
-            store.settle_reading, owner, reading_id,
-            text=generated["text"] if retain else None,
-            model=generated.get("model"),
-            prompt_tokens=generated.get("prompt_tokens"),
-            completion_tokens=generated.get("completion_tokens"),
-            provider_cost_microusd=generated.get("provider_cost_microusd"))
-        balance = await asyncio.to_thread(balance_view, owner)
-        view = reading_view(settled)
-        view["text"] = generated["text"]
-        view["credits_charged"] = settled["credits"]
-        view["balance_after"] = balance.get("available")
-        return JSONResponse(view)
+            if not reserved.get("created", True):
+                # The reservation already existed (Astra round-1 F6):
+                # only the creating caller generates. Everyone else gets
+                # the stored outcome — generating here could settle this
+                # caller's scan text into the first caller's reading, or
+                # release the first caller's reservation on failure.
+                return await replay_answer(reserved)
+            # The store may have adopted an earlier attempt's reading id
+            # for this request key (durable reservation intent, batch 2b
+            # item 1); settle/release always target the reserved row.
+            reading_id = reserved["id"]
+            try:
+                # Async generation: the provider call is cancellable
+                # at the service deadline in every network phase
+                # (Astra round-4 F8), which a threaded sync call
+                # cannot guarantee during connection setup.
+                generated = await reading_service.generate_async(scan)
+            except ReadingGenerationError as generation_error:
+                await asyncio.to_thread(store.release_reading, owner, reading_id,
+                                        error_code=generation_error.code,
+                                        deliver=False)
+                # This call created the reading and the failure is
+                # terminal for it (released in full above): identify it
+                # as terminal, like a replayed stored failure (N8).
+                return JSONResponse({"error": generation_error.code,
+                                     "reading_id": reading_id, "state": "failed",
+                                     "terminal": True}, status_code=400)
+            except Exception:
+                # Any other generation failure still releases in full
+                # before the error surfaces (design §4.1 step 5); the
+                # orphan reconcile is only the backstop.
+                await asyncio.to_thread(store.release_reading, owner, reading_id,
+                                        error_code="reading_unavailable",
+                                        deliver=False)
+                raise
+            # If the parent scan's content expired mid-generation, the
+            # text is delivered on this response only and not retained
+            # (its lifetime follows the scan's, design §3.5).
+            try:
+                fresh = await asyncio.to_thread(store.get, owner, confirmation["scan_id"])
+                retain = not fresh["payload"].get("content_removed")
+            except KeyError:
+                retain = False
+            settled = await asyncio.to_thread(
+                store.settle_reading, owner, reading_id,
+                text=generated["text"] if retain else None,
+                model=generated.get("model"),
+                prompt_tokens=generated.get("prompt_tokens"),
+                completion_tokens=generated.get("completion_tokens"),
+                provider_cost_microusd=generated.get("provider_cost_microusd"))
+            balance = await asyncio.to_thread(balance_view, owner)
+            view = reading_view(settled)
+            view["text"] = generated["text"]
+            view["credits_charged"] = settled["credits"]
+            view["balance_after"] = balance.get("available")
+            return JSONResponse(view)
+        finally:
+            if gate_lease is not None:
+                gate_lease.release()
 
     async def reading_get(request):
         if not reading_gate_open():

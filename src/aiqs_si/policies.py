@@ -450,6 +450,18 @@ def policy_posture_problems(environ=None):
                 problems.append(
                     f"{PRICING_POLICY_ENV}: does not set {key!r}; "
                     "the default would apply silently")
+        # An ACTIVE campaign is money-bearing on its own (batch
+        # 2e, R4): a campaign block that omits its rate silently
+        # inherits the base rate, charging a price nobody pinned
+        # for the campaign.
+        campaign = pricing.get("campaign")
+        if isinstance(campaign, dict) and campaign.get("active") is True:
+            if not ("credits_per_shot_tenths" in campaign
+                    or "credits_per_shot" in campaign):
+                problems.append(
+                    f"{PRICING_POLICY_ENV}: the active campaign does not "
+                    "set its own shot rate; it would silently inherit "
+                    "the base rate")
 
     grant = parsed(GRANT_POLICY_ENV)
     if grant is None:
@@ -470,6 +482,16 @@ def policy_posture_problems(environ=None):
                 problems.append(
                     f"{GRANT_POLICY_ENV}: does not set {key!r}; set a "
                     "number or an explicit null (dormant, monitored)")
+        # The remaining grant amounts are money-bearing too
+        # (batch 2e, R4): signup/migration/loyalty amounts left
+        # unmentioned silently inherited their built-in defaults
+        # while only the referral amount was pinned.
+        for key in ("signup_campaign_credits", "migration_credits",
+                    "legacy_loyalty_gift_credits"):
+            if key not in grant:
+                problems.append(
+                    f"{GRANT_POLICY_ENV}: does not set {key!r}; "
+                    "the default grant amount would apply silently")
 
     limit = parsed(LIMIT_POLICY_ENV)
     if limit is None:
@@ -484,6 +506,31 @@ def policy_posture_problems(environ=None):
                 problems.append(
                     f"{LIMIT_POLICY_ENV}: does not set {key!r}; set a "
                     "number or an explicit null (unlimited, monitored)")
+        # The per-job scan width is an operator decision like
+        # its sibling keys (batch 2e, R4), not a default to
+        # inherit silently. (claim_ttl_seconds stays a loader
+        # default: it is a liveness bound, not an exposure or
+        # money value — recorded in the batch 2e notes.)
+        if "scan_units_per_job" not in limit:
+            problems.append(
+                f"{LIMIT_POLICY_ENV}: does not set 'scan_units_per_job'; "
+                "the default would apply silently")
+
+    # Presence is not validity (batch 2e, R4): a key present
+    # with a wrong-typed or out-of-range value passed the
+    # presence checks above while the loader would reject it
+    # later — or, on a path that never loads it, never. Run the
+    # real loaders for every policy that parsed, and surface a
+    # loader rejection as a posture problem at the same gate.
+    for env_name, parsed_obj, loader in (
+            (PRICING_POLICY_ENV, pricing, load_pricing_policy),
+            (GRANT_POLICY_ENV, grant, load_grant_policy),
+            (LIMIT_POLICY_ENV, limit, load_limit_policy)):
+        if isinstance(parsed_obj, dict):
+            try:
+                loader(environ)
+            except PolicyError as error:
+                problems.append(f"{env_name}: {error}")
     return problems
 
 

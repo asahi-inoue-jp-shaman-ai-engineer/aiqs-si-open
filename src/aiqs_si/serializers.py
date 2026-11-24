@@ -79,6 +79,22 @@ def _public_entries(store, payload, raw_entries):
     return public
 
 
+def canonical_scan_entries(store, payload, raw_entries):
+    """The one selected-entry set (batch 2e, R5): the entries
+    publication shows are the entries irradiation executes.
+    submit_irradiation binds its execution input from this
+    projection — same catalog resolution, deduplication and
+    publication cap — instead of copying the worker's raw
+    stored list, so an entry the owner never saw (an eleventh
+    resolvable entry, a duplicate, an unresolvable id) cannot
+    reach the device. Execution shape: the device consumes
+    only the entry id; hits/rank ride along as the published
+    provenance."""
+    return [{"id": entry["entry_id"], "hits": entry["hits"],
+             "rank": entry["rank"]}
+            for entry in _public_entries(store, payload, raw_entries)]
+
+
 def _public_result(store, job, payload, result):
     view = {}
     mode = public_mode(result.get("mode"))

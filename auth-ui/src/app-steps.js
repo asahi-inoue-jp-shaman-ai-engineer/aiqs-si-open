@@ -15,6 +15,10 @@
 // account, history, guide, error) have no step label — the
 // indicator is hidden there rather than showing a misleading
 // position.
+// The wait (scan) and progress (irradiation) labels likewise
+// depend on the job: they derive from the recorded state the
+// caller passes as context, and only a running job earns the
+// '中' wording (batch 2e, R7).
 // Keeping the mapping in a pure module makes it testable without
 // a DOM.
 const STEP_LABELS = {
@@ -25,17 +29,36 @@ const STEP_LABELS = {
   intention: 'ステップ 2 / 5 — 意図',
   affirmation: 'ステップ 2 / 5 — 自己愛アファーメーション',
   'scan-confirm': 'ステップ 2 / 5 — 内容の確認',
-  wait: 'ステップ 3 / 5 — スキャン中',
   ranking: 'ステップ 4 / 5 — 結果',
   'reading-confirm': 'ステップ 4 / 5 — 結果（リーディングの確認）',
   'reading-wait': 'ステップ 4 / 5 — 結果（リーディングを送信中）',
   'reading-result': 'ステップ 4 / 5 — 結果（リーディング）',
   count: 'ステップ 5 / 5 — 照射の回数',
   confirm: 'ステップ 5 / 5 — 照射の確認',
-  progress: 'ステップ 5 / 5 — 照射中',
 };
 
+// The wait and progress labels derive from the job's recorded
+// state, exactly like the body text does (batch 2e, R7): the
+// fixed 'スキャン中'/'照射中' labels claimed execution for jobs
+// still queued, jobs whose outcome is unknown, and terminal
+// replays. '中' is earned only by 'running'; a queued job is
+// まち, an unknown one is 確認中, and anything else — terminal
+// states and a missing context included — takes the neutral
+// noun, which claims nothing about execution.
+function stateStepLabel(step, noun, state) {
+  if (state === 'running') return `${step} — ${noun}中`;
+  if (state === 'queued') return `${step} — ${noun}まち`;
+  if (state === 'unknown') return `${step} — ${noun}を確認中`;
+  return `${step} — ${noun}`;
+}
+
 export function stepLabelFor(screen, context = null) {
+  if (screen === 'wait') {
+    return stateStepLabel('ステップ 3 / 5', 'スキャン', context?.state);
+  }
+  if (screen === 'progress') {
+    return stateStepLabel('ステップ 5 / 5', '照射', context?.state);
+  }
   if (screen === 'proof') {
     return context?.state === 'completed' && context?.operation !== 'scan'
       ? '完了 — 稼働証明' : '稼働証明 — 詳細';

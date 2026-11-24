@@ -338,6 +338,7 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                     created_at REAL NOT NULL,
                     finished_at REAL, outcome TEXT,
                     queued_at REAL, sent_at REAL, viewed_at REAL,
+                    suppressed_reason TEXT,
                     claimed_at REAL, claim_id TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt_at REAL, last_error TEXT,
@@ -598,6 +599,15 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                 if "consent" not in intent_columns:
                     db.execute("ALTER TABLE app_submission_intents "
                                "ADD COLUMN consent TEXT")
+            # Batch 2e, R6: suppression gains a reason column, so
+            # a cancellation no longer has to borrow viewed_at —
+            # a field whose meaning is "the owner saw the result"
+            # — to record that no mail is owed.
+            notification_columns = {row[1] for row in
+                                    db.execute("PRAGMA table_info(job_notifications)").fetchall()}
+            if notification_columns and "suppressed_reason" not in notification_columns:
+                db.execute("ALTER TABLE job_notifications "
+                           "ADD COLUMN suppressed_reason TEXT")
             # The 1:1 rule binds active links only (design §3.1/§6.4): a plain
             # UNIQUE on the player column would also freeze unlinked rows and
             # permanently block a legitimate re-link under a new SI account.
@@ -2399,6 +2409,7 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             # the job's state.
             db.execute(
                 "UPDATE job_notifications SET status='suppressed', "
+                "suppressed_reason='viewed', "
                 "viewed_at=?, email=NULL WHERE job=?",
                 (viewed["viewed_at"], job))
             return True
@@ -2419,7 +2430,8 @@ class Store(CatalogStore, GrantStore, ReferralStore):
         elif state == "cancelled":
             db.execute(
                 "UPDATE job_notifications SET status='suppressed', "
-                "viewed_at=?, email=NULL WHERE job=?", (now, job))
+                "suppressed_reason='cancelled', email=NULL WHERE job=?",
+                (job,))
         return True
 
     def set_job_notification(self, job, *, owner, operation, mode, email):
@@ -2525,6 +2537,8 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                 "UPDATE job_notifications SET "
                 "status=CASE WHEN status IN ('armed','queued') "
                 "THEN 'suppressed' ELSE status END, "
+                "suppressed_reason=CASE WHEN status IN ('armed','queued') "
+                "THEN 'viewed' ELSE suppressed_reason END, "
                 "viewed_at=?, "
                 "email=CASE WHEN status IN ('armed','queued') "
                 "THEN NULL ELSE email END, "
@@ -2555,13 +2569,18 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             (now, state, now, now, job))
 
     def _suppress_notification(self, db, job):
-        """The owner acted in person (cancel): no mail is owed."""
+        """The owner acted in person (cancel): no mail is owed.
+        The suppression records its reason (batch 2e, R6) and
+        does NOT write viewed_at: the owner has not viewed any
+        result — there is none — and viewed_at keeps its single
+        meaning everywhere it is consulted."""
         db.execute(
             "UPDATE job_notifications SET status='suppressed', "
-            "viewed_at=?, email=NULL, resume_token=NULL, "
+            "suppressed_reason='cancelled', email=NULL, "
+            "resume_token=NULL, "
             "mail_subject=NULL, mail_body=NULL, mail_sender=NULL "
             "WHERE job=? AND status IN ('armed','queued')",
-            (time.time(), job))
+            (job,))
 
     def escalate_completion_notifications(self, now=None):
         """Maintenance sweep (pure bookkeeping, no sending):
@@ -2588,6 +2607,7 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                 if row["viewed_at"] is not None:
                     db.execute(
                         "UPDATE job_notifications SET status='suppressed', "
+                        "suppressed_reason='viewed', "
                         "email=NULL, resume_token=NULL, claimed_at=NULL, "
                         "claim_id=NULL, attempts=?, mail_subject=NULL, "
                         "mail_body=NULL, mail_sender=NULL WHERE job=?",
@@ -2619,9 +2639,10 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                 if row["state"] == "cancelled":
                     db.execute(
                         "UPDATE job_notifications SET status='suppressed', "
-                        "viewed_at=?, email=NULL WHERE job=? "
+                        "suppressed_reason='cancelled', email=NULL "
+                        "WHERE job=? "
                         "AND status='armed' AND finished_at IS NULL",
-                        (now, row["job"]))
+                        (row["job"],))
                 elif row["mode"] == "notify":
                     db.execute(
                         "UPDATE job_notifications SET finished_at=?, "
@@ -2639,6 +2660,7 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             # the record got here (Astra round-3 F5).
             cursor = db.execute(
                 "UPDATE job_notifications SET status='suppressed', "
+                "suppressed_reason='viewed', "
                 "email=NULL, resume_token=NULL, mail_subject=NULL, "
                 "mail_body=NULL, mail_sender=NULL "
                 "WHERE status IN ('armed','queued') AND job IN "
@@ -2753,6 +2775,7 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             if row["viewed_at"] is not None:
                 db.execute(
                     "UPDATE job_notifications SET status='suppressed', "
+                    "suppressed_reason='viewed', "
                     "attempts=?, last_error=?, email=NULL, "
                     "resume_token=NULL, claimed_at=NULL, claim_id=NULL, "
                     "mail_subject=NULL, mail_body=NULL, mail_sender=NULL "
@@ -2789,6 +2812,8 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                 "UPDATE job_notifications SET "
                 "status=CASE WHEN status IN ('armed','queued') "
                 "THEN 'suppressed' ELSE status END, "
+                "suppressed_reason=CASE WHEN status IN ('armed','queued') "
+                "THEN 'viewed' ELSE suppressed_reason END, "
                 "viewed_at=?, "
                 "email=CASE WHEN status IN ('armed','queued') "
                 "THEN NULL ELSE email END, "
@@ -2841,6 +2866,7 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             if row["viewed_at"] is not None or marker is not None:
                 db.execute(
                     "UPDATE job_notifications SET status='suppressed', "
+                    "suppressed_reason='viewed', "
                     "email=NULL, resume_token=NULL, claimed_at=NULL, "
                     "claim_id=NULL, mail_subject=NULL, mail_body=NULL, "
                     "mail_sender=NULL WHERE job=?", (job,))
@@ -4212,8 +4238,16 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             # schema (result_schema): a stored result carrying a
             # nested object or an out-of-vocabulary value publishes
             # None for that field, never the raw value.
+            # Execution counts bind ONLY for irradiation (batch
+            # 2e, R5): a scan has no reservation and no progress
+            # record, so a scan result's own requested/completed
+            # figures are unsupported claims — the proof publishes
+            # them as unavailable (None) instead of falling back
+            # to the worker's numbers.
+            is_irradiation = payload.get("operation") == "irradiation"
             completed = progress["completed"] if progress else (
-                public_count(result.get("completed_count")) if result else None)
+                public_count(result.get("completed_count"))
+                if result and is_irradiation else None)
             # The reservation in the payload is authoritative for
             # the requested count (batch 2d, MEDIUM 5): the proof
             # previously preferred the worker's own figure, so a
@@ -4221,7 +4255,8 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             # certified another.
             _payload_count = payload.get("irradiation_count")
             requested = _payload_count if type(_payload_count) is int else (
-                public_count(result.get("requested_count")) if result else None)
+                public_count(result.get("requested_count"))
+                if result and is_irradiation else None)
             evidence = {
                 "job_id": row["id"],
                 "operation": payload.get("operation"),

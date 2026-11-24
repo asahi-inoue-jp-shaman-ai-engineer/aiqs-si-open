@@ -153,6 +153,17 @@ test('app-glass: audit B round 2 layout fixes stay in place', () => {
   assert.match(appJs, /sessionRow\.cost\.toLocaleString\('ja-JP'\)\}\\u00A0クレジット/);
 });
 
+test('app-glass: public pages share the phrase-aware breaking', () => {
+  // The landing (home.js) prose and the entry page's aside
+  // carry the same auto-phrase treatment as the app screens,
+  // scoped to reading paragraphs only — the purchase page's
+  // own aside and the app screens' rules are untouched.
+  assert.match(styleCss, /\.home-details p,\.intro \.lead,\.entry-aside p\{word-break:auto-phrase;text-wrap:pretty\}/);
+  // The entry page's aside carries the hook class the rule
+  // is scoped to.
+  assert.match(indexHtml, /<aside class="entry-aside">/);
+});
+
 test('app-glass: gift notice is a modal over a scrim with an inert stage', () => {
   assert.match(styleCss, /body\.si-app \.gift-overlay\{\s*position:fixed;inset:0;z-index:90;/);
   // The notice carries its own opaque glass card, so its

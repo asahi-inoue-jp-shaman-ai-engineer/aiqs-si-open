@@ -230,7 +230,16 @@ class Service:
             # scan instead of letting the stamp slip through.
             raise ValueError("Synthetic scan cannot be irradiated in production; scan again")
         validate_prayer(scan["payload"])
-        entries = scan["result"]["scan"]["final_entries"]
+        # One canonical selection for publication, confirmation
+        # and execution (batch 2e, R5): the irradiation input is
+        # the catalog-validated, deduplicated, publication-capped
+        # set the owner saw and approved — never the worker's
+        # raw stored list, which may carry entries publication
+        # dropped (excess, duplicates, unresolvable ids).
+        from .serializers import canonical_scan_entries
+        entries = canonical_scan_entries(
+            self.store, scan["payload"],
+            scan["result"]["scan"]["final_entries"])
         if not entries:
             raise ValueError("Scan has no selected entries")
         payload = {"operation": "irradiation", "scan_id": scan_id,

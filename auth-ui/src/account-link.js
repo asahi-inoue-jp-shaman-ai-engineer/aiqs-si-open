@@ -1,14 +1,23 @@
 import { createAccountClient } from './account-api.js';
-import { createTokenProvider, installCarriedLinkRefresh } from './account-session.js';
+import { createFragmentSession, installCarriedLinkRefresh } from './account-session.js';
 
 // D-Planet linking screen (the auth-ui secondary path; the MCP tools
 // run the identical flow). Verify only parks a reservation: the link
 // completes solely when the user confirms the pairing after seeing
 // BOTH account names, exactly like the agent-driven path.
-export function showAccountLink({ fetch = globalThis.fetch, getToken } = {}) {
+export function showAccountLink({ fetch = globalThis.fetch, getToken, withToken } = {}) {
   document.title = 'Aiqs SI — D-Planet連携';
-  const tokenProvider = getToken || createTokenProvider(location, history);
-  const client = createAccountClient({ fetch, getToken: tokenProvider });
+  // The page joins the shared-session protocol (batch 2e, R1):
+  // its fragment token is bound to the app session's lineage
+  // and dispatched under the synchronous fence, so a session
+  // replaced in another tab retires this page's credentials
+  // instead of letting them act on the old account.
+  const session = getToken ? null : createFragmentSession({ location, history });
+  const tokenProvider = getToken || session.getToken;
+  const client = createAccountClient({
+    fetch, getToken: tokenProvider,
+    withToken: withToken || session?.withToken,
+  });
   document.body.innerHTML = `<main>
     <header><a href="/">Aiqs SI</a><span>あなたとAIの、祈りのために</span></header>
     <section class="card"><p class="eyebrow">アカウント連携</p>
@@ -66,7 +75,7 @@ export function showAccountLink({ fetch = globalThis.fetch, getToken } = {}) {
   // Keep the session when the user follows this page's own links
   // to another account page (fragment handoff, account-session.js).
   const refreshCarriedLinks = installCarriedLinkRefresh({
-    target: window, document, tokenProvider,
+    target: window, document, tokenProvider, session,
   });
   void refreshCarriedLinks?.();
   const sections = ['link-form', 'link-confirm', 'link-linked', 'link-login'];

@@ -2,6 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAppAuth } from '../src/app-auth.js';
 import { createAppClient } from '../src/app-api.js';
+import { ensureFragmentHandoff } from '../src/account-session.js';
+
+// The pending handoff nonce, read through the protocol's own
+// API (batch 2f: the nonce lives inside the single handoff
+// record, not under a raw key a test can read directly).
+const pendingNonce = (map) => ensureFragmentHandoff({
+  getItem: (k) => map.get(k) ?? null,
+  setItem: (k, v) => map.set(k, v),
+  removeItem: (k) => map.delete(k),
+});
 
 function fixture({ search = '', responder } = {}) {
   const items = new Map();
@@ -206,7 +216,7 @@ test('takeFragment adopts only a state-bound handoff token', async () => {
   assert.equal(auth.takeFragment(), false);
   assert.equal(await auth.getToken(), null);
   // The nonce this browser armed at construction is the only key.
-  const state = items.get('si-fragment-handoff-v1');
+  const state = pendingNonce(items);
   assert.ok(state);
   location.hash = `#access_token=handed-over&state=${state}`;
   assert.equal(auth.takeFragment(), true);
@@ -223,7 +233,7 @@ test('a fragment adoption clears a persisted session from another account', asyn
   persistent.set('si-app-session-v1',
     JSON.stringify({ refreshToken: 'someone-elses', savedAt: 1 }));
   const auth = make();
-  const state = session.get('si-fragment-handoff-v1');
+  const state = pendingNonce(session);
   assert.ok(state);
   location.hash = `#access_token=mine-now&state=${state}`;
   assert.equal(auth.takeFragment(), true);
@@ -252,7 +262,7 @@ test('a delayed refresh cannot resurrect the previous account after a handoff', 
   const auth = make();
   const pending = auth.getToken(); // starts account A's refresh
   // While it is in flight, a state-bound handoff for account B lands.
-  const state = session.get('si-fragment-handoff-v1');
+  const state = pendingNonce(session);
   assert.ok(state);
   location.hash = '#' + new URLSearchParams({ access_token: 'b-access', state }).toString();
   assert.equal(auth.takeFragment(), true);
@@ -292,7 +302,7 @@ test('a stale rejection cannot clear the session a handoff just created', async 
   // Let the token request settle, then adopt B's handoff before
   // the pending getToken() settles.
   await Promise.resolve();
-  const state = session.get('si-fragment-handoff-v1');
+  const state = pendingNonce(session);
   assert.ok(state);
   location.hash = '#' + new URLSearchParams({ access_token: 'b-access', state }).toString();
   assert.equal(auth.takeFragment(), true);
@@ -335,7 +345,7 @@ test('a generation change during a deferred response body still discards the old
   const auth = make();
   const pending = auth.getToken(); // starts account A's refresh
   await bodyCalled; // A's response is now mid-parse
-  const state = session.get('si-fragment-handoff-v1');
+  const state = pendingNonce(session);
   assert.ok(state);
   location.hash = '#' + new URLSearchParams({ access_token: 'b-access', state }).toString();
   assert.equal(auth.takeFragment(), true);
@@ -379,7 +389,7 @@ test('cross-tab: a late refresh for the old account cannot resurrect it (batch 2
   await new Promise((resolve) => setImmediate(resolve));
   // Tab 2 adopts B through the state-bound fragment handoff.
   const tabB = make();
-  const nonce = session.get('si-fragment-handoff-v1');
+  const nonce = pendingNonce(session);
   assert.ok(nonce);
   location.hash = `#access_token=access-b&state=${nonce}`;
   assert.equal(tabB.takeFragment(), true);
@@ -477,7 +487,7 @@ test('cross-tab: a fragment-only session is superseded by another tab (round 2)'
     },
   });
   const tabA = make();
-  const nonce = session.get('si-fragment-handoff-v1');
+  const nonce = pendingNonce(session);
   assert.ok(nonce);
   location.hash = `#access_token=access-frag-a&state=${nonce}`;
   assert.equal(tabA.takeFragment(), true);

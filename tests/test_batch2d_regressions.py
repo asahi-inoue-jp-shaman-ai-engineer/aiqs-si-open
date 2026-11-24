@@ -189,7 +189,11 @@ class ReadingSlotAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reading_pool_still_bounds_execution(self):
         # The execution bound itself is unchanged: four readings
-        # executing concurrently still 503 the fifth.
+        # executing concurrently still 503 the fifth. Since
+        # batch 2e (R2) the APPLICATION acquires the pool through
+        # the scope gate after its authentication, so this stub
+        # does exactly what readings_create does: acquire, and
+        # answer 503 itself when the pool is full.
         entered = asyncio.Event()
         release = asyncio.Event()
         calls = []
@@ -197,8 +201,17 @@ class ReadingSlotAdmissionTests(unittest.IsolatedAsyncioTestCase):
         async def app(scope, receive, send):
             calls.append(scope["path"])
             await receive()
+            gate = scope.get("aiqs_si.reading_gate")
+            lease = await gate.acquire() if gate is not None else None
+            if gate is not None and lease is None:
+                await send({"type": "http.response.start", "status": 503,
+                            "headers": []})
+                await send({"type": "http.response.body", "body": b"busy"})
+                return
             entered.set()
             await release.wait()
+            if lease is not None:
+                lease.release()
             await send({"type": "http.response.start", "status": 200,
                         "headers": []})
             await send({"type": "http.response.body", "body": b"ok"})
@@ -224,7 +237,10 @@ class ReadingSlotAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(statuses, [503])
         release.set()
         await asyncio.gather(*tasks)
-        self.assertEqual(len(calls), 4)
+        # The fifth request reached the application and was
+        # refused by the gate (503 above) without executing.
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(guard.reading_active, 0)
 
 
 class WorkerBoundaryVerificationTests(unittest.IsolatedAsyncioTestCase):

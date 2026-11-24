@@ -38,15 +38,25 @@ health, account operations and cancellation alike. Now:
   the direct peer only, so behind a tunnel it degrades to a second
   process-wide bucket and the lane caps remain the real bound.
 - Reading generation has its own execution pool (batch 2d,
-  HIGH 2): admission is a two-phase swap. The caller's LANE slot
-  covers admission and body buffering — an unauthenticated
+  HIGH 2; acquisition moved behind authentication in batch 2e,
+  R2). The caller's LANE slot covers admission, body buffering
+  and everything the application does BEFORE generation —
+  including its own authentication, however long that takes
+  (a stalled JWKS refresh included): an unauthenticated
   reading POST consumes public slots under the public body
-  deadline, an authenticated one authenticated slots — so held
-  uploads always occupy bounded lane capacity. Once the body is
-  fully buffered, the lane slot is released and the reading
-  pool slot is acquired for the execution alone: a slot pays
-  for provider wait, never for upload, and a generation never
-  holds a lane slot hostage either.
+  deadline, an authenticated one authenticated slots, so the
+  preceding work always occupies bounded lane capacity. The
+  application acquires the reading pool slot through the gate
+  installed in the scope (aiqs_si.reading_gate) only after it
+  has authenticated the caller and is about to generate:
+  acquisition releases the lane slot and takes the pool slot
+  for the generation alone. A request that never reaches
+  generation — forged token, failed validation, replay —
+  never touches the pool at all; the earlier swap design
+  acquired the pool slot right after buffering, so four
+  fully uploaded unauthenticated requests waiting on
+  application authentication could still fill the pool and
+  503 a legitimate reading (the round-2 counterexample).
 - Worker-token rotation has a reserved verification channel
   (batch 2d, HIGH 3): the shared verification budget is spent by
   whoever sends forged tokens, so a brand-new legitimate token
@@ -90,10 +100,10 @@ def worker_boundary_key_from_env(environ=None):
 class _SlotLease:
     """One held admission counter with an idempotent release.
 
-    The reading lane swap hands the lane slot back mid-request
-    (after buffering, before execution); the lane branch's own
-    finally also releases, so the release must be safe to call
-    twice — exactly one decrement ever happens."""
+    The reading gate hands the lane slot back mid-request (at
+    generation, after application authentication); the lane
+    branch's own finally also releases, so the release must be
+    safe to call twice — exactly one decrement ever happens."""
 
     def __init__(self, guard, attribute):
         self._guard = guard
@@ -105,6 +115,49 @@ class _SlotLease:
             self._held = False
             setattr(self._guard, self._attribute,
                     getattr(self._guard, self._attribute) - 1)
+
+
+class _ReadingGate:
+    """The reading pool hand-off for ONE reading creation
+    (batch 2e, R2). The lane branch installs an instance in the
+    request scope; the application calls acquire() once it has
+    authenticated the caller and is about to generate, and
+    releases the returned lease when generation settles.
+    Acquisition is the swap point: the caller's lane lease is
+    released and the pool slot is taken, atomically from the
+    counters' point of view (no await between them). A full
+    pool answers None — the application refuses with 503 BEFORE
+    it has reserved or charged anything, so the client may
+    retry under the same request key. abandon() is the
+    middleware's safety net after the application returns: a
+    lease the application forgot (or never took because it
+    answered early) is released exactly once."""
+
+    def __init__(self, guard, lane_lease):
+        self._guard = guard
+        self._lane_lease = lane_lease
+        self._slot = None
+        self._attempted = False
+
+    async def acquire(self):
+        if self._slot is not None:
+            return self._slot
+        if self._attempted:
+            return None
+        self._attempted = True
+        if self._lane_lease is not None:
+            self._lane_lease.release()
+        guard = self._guard
+        if guard.reading_active >= guard.reading_max_concurrent:
+            return None
+        guard.reading_active += 1
+        self._slot = _SlotLease(guard, "reading_active")
+        return self._slot
+
+    def abandon(self):
+        if self._slot is not None:
+            self._slot.release()
+            self._slot = None
 
 
 _HEALTH_PATHS = frozenset({"/health"})
@@ -428,17 +481,17 @@ class RequestBodyLimit:
 
     async def _serve_reading(self, scope, receive, send, *, body_timeout=None,
                              lease=None):
-        # Admission shape (batch 2d, HIGH 2, round-2 form): the
-        # caller's LANE slot — acquired by the lane branch before
-        # this runs — covers admission and body buffering, so a
-        # held upload always occupies bounded lane capacity. The
-        # reading pool pays for EXECUTION only: inside _request,
-        # once the body is fully buffered, the lane lease is
-        # released and the reading slot is taken for the
-        # application's run. Neither pool can be held hostage by
-        # the other's phase: uploads cannot occupy generation
-        # slots (the original HIGH), and generations cannot occupy
-        # lane slots (batch 2b item 5's concern, preserved).
+        # Admission shape (batch 2e, R2): the caller's LANE slot
+        # — acquired by the lane branch before this runs —
+        # covers admission, body buffering and the application's
+        # pre-generation work (its own authentication included).
+        # The reading pool pays for GENERATION only, acquired
+        # through the gate _request installs in the scope once
+        # the application has authenticated the caller. Neither
+        # pool can be held hostage by the other's phase: uploads
+        # and stalled authentications cannot occupy generation
+        # slots, and generations cannot occupy lane slots (batch
+        # 2b item 5's concern, preserved).
         await self._request(scope, receive, send,
                             body_timeout=body_timeout, reading=True,
                             lease=lease)
@@ -697,21 +750,19 @@ class RequestBodyLimit:
             return await receive()
 
         if reading:
-            # The swap: the body is fully buffered under the lane
-            # lease; hand the lane slot back and take the reading
-            # pool slot for the execution alone. If the pool is
-            # full the request is refused AFTER buffering — the
-            # lane slot is already released, so the refusal itself
-            # holds nothing.
-            if lease is not None:
-                lease.release()
-            if self.reading_active >= self.reading_max_concurrent:
-                return await JSONResponse({"error": "server_busy"}, status_code=503,
-                                          headers={"Retry-After": "1"})(scope, receive, send)
-            self.reading_active += 1
+            # Hand the application the gate, not the slot: the
+            # pool is acquired only when the application calls
+            # the gate after authenticating the caller (batch
+            # 2e, R2). Until then this request holds its lane
+            # lease alone. abandon() after the run releases any
+            # lease the application took and did not release
+            # itself (an early answer, an exception, a dropped
+            # connection) — exactly once, via the lease.
+            gate = _ReadingGate(self, lease)
+            scope["aiqs_si.reading_gate"] = gate
             try:
                 await self.app(scope, bounded_receive, send)
             finally:
-                self.reading_active -= 1
+                gate.abandon()
             return
         await self.app(scope, bounded_receive, send)

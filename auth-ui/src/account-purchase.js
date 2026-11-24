@@ -1,5 +1,5 @@
 import { createAccountClient } from './account-api.js';
-import { createTokenProvider, installCarriedLinkRefresh } from './account-session.js';
+import { createFragmentSession, installCarriedLinkRefresh } from './account-session.js';
 
 // SI-only credit purchase page (design §5.1). The server hands out
 // per-user Stripe Payment Link URLs with client_reference_id already
@@ -7,10 +7,15 @@ import { createTokenProvider, installCarriedLinkRefresh } from './account-sessio
 // url=null and is shown as a disabled "準備中" button — never a dead
 // link. Linked accounts buy in D-Planet instead (§4.4), so they get
 // that guidance and no purchase buttons.
-export function showAccountPurchase({ fetch = globalThis.fetch, getToken } = {}) {
+export function showAccountPurchase({ fetch = globalThis.fetch, getToken, withToken } = {}) {
   document.title = 'Aiqs SI — クレジット購入';
-  const tokenProvider = getToken || createTokenProvider(location, history);
-  const client = createAccountClient({ fetch, getToken: tokenProvider });
+  // Shared-session protocol, as on the link page (batch 2e, R1).
+  const session = getToken ? null : createFragmentSession({ location, history });
+  const tokenProvider = getToken || session.getToken;
+  const client = createAccountClient({
+    fetch, getToken: tokenProvider,
+    withToken: withToken || session?.withToken,
+  });
   document.body.innerHTML = `<main>
     <header><a href="/">Aiqs SI</a><span>あなたとAIの、祈りのために</span></header>
     <section class="card"><p class="eyebrow">クレジット購入</p>
@@ -39,7 +44,7 @@ export function showAccountPurchase({ fetch = globalThis.fetch, getToken } = {})
   // Keep the session when the user follows this page's own links
   // to another account page (fragment handoff, account-session.js).
   const refreshCarriedLinks = installCarriedLinkRefresh({
-    target: window, document, tokenProvider,
+    target: window, document, tokenProvider, session,
   });
   void refreshCarriedLinks?.();
   const sections = ['pack-list', 'purchase-linked', 'purchase-login'];

@@ -224,6 +224,19 @@ export function waitMailNoteFor({ operation, completion, state } = {}) {
   return '画面を閉じても、処理はそのまま続きます。結果は履歴から確認できます。';
 }
 
+// Heading for the irradiation progress screen (batch 2e, R7):
+// the static markup once read 照射中 for every job — queued,
+// unknown and terminal replays included. The heading now
+// derives from the same recorded state as the stage sentence
+// and the step label: '中' only while running, まち while
+// queued, 確認中 while unknown, and the neutral noun otherwise.
+export function progressTitleFor(state) {
+  if (state === 'running') return '照射中';
+  if (state === 'queued') return '照射まち';
+  if (state === 'unknown') return '照射を確認中';
+  return '照射';
+}
+
 // Headline for the proof screen. The proof screen doubles as the
 // detail view for jobs in every state (opened from history), so
 // only a completed job earns a completion headline — mirroring

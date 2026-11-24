@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   RANKING_DISPLAY_LIMIT, displayedRankingEntries, elapsedText,
-  notifyWaitTextFor, proofHeadline, progressCountText, rankingCountText,
-  stageTextFor, waitMailNoteFor,
+  notifyWaitTextFor, proofHeadline, progressCountText, progressTitleFor,
+  rankingCountText, stageTextFor, waitMailNoteFor,
 } from '../src/app-wait.js';
 
 // Field finding (2026-11-22 live check): on the scan waiting
@@ -63,6 +63,15 @@ test('progress count text never invents an unreported count (rule 7)', () => {
   assert.equal(progressCountText(null, 33), '— / 33 回');
   assert.equal(progressCountText(undefined, 99), '— / 99 回');
   assert.equal(progressCountText(undefined, undefined), '— / — 回');
+});
+
+test('progress heading derives from the recorded state (batch 2e, R7)', () => {
+  assert.equal(progressTitleFor('running'), '照射中');
+  assert.equal(progressTitleFor('queued'), '照射まち');
+  assert.equal(progressTitleFor('unknown'), '照射を確認中');
+  for (const state of ['completed', 'failed', 'cancelled', undefined, null]) {
+    assert.equal(progressTitleFor(state), '照射', String(state));
+  }
 });
 
 test('proof headline claims completion only for completed jobs', () => {

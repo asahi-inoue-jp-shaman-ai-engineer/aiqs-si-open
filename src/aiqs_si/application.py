@@ -41,6 +41,33 @@ class _OnboardingNoStore:
         await self.app(scope, receive, no_store)
 
 
+def _enforce_policy_coherence(store):
+    """The policies IN EFFECT must be the policies the deployment
+    environment NOW describes (batch 2e, R4). Two snapshots can
+    silently diverge from a fresh env load: the pricing module
+    froze its policy at import time, and the store froze its
+    grant/limit policies at construction. A host that imports or
+    constructs before the service env is fully applied would
+    then run production on stale money/exposure values while the
+    env — and the posture check — say otherwise. Field-wise
+    comparison against fresh loads; any divergence refuses the
+    composition. Policy values themselves are never reported."""
+    from . import pricing
+    from .policies import (load_grant_policy, load_limit_policy,
+                           load_pricing_policy)
+    held_pairs = (
+        ("pricing", pricing._POLICY, load_pricing_policy()),
+        ("grant", store.grant_policy, load_grant_policy()),
+        ("limit", store.limit_policy, load_limit_policy()),
+    )
+    for name, held, fresh in held_pairs:
+        if vars(held) != vars(fresh):
+            raise ValueError(
+                f"the {name} policy in effect diverges from the "
+                "deployment environment; refusing to start a "
+                "production composition on stale policy values")
+
+
 def create_application(store, user_verifier, worker_verifier, *, allowed_workers, service=None, billing=None, ui_directory=None,
                        onboarding_config=None, onboarding_binding=None, onboarding_hook_secret=None,
                        internal_link_key=None, dplanet_client=None, payment_links=None,
@@ -56,9 +83,24 @@ def create_application(store, user_verifier, worker_verifier, *, allowed_workers
     # policies silently. A production signal (the deployment
     # marker, or the production issuer) now requires the same
     # explicit posture here.
-    if (store_in_production(store, url=user_verifier.issuer)
-            or production_environment(url=worker_verifier.issuer)):
+    production = (store_in_production(store, url=user_verifier.issuer)
+                  or production_environment(url=worker_verifier.issuer))
+    if production:
         enforce_policy_posture()
+        # Worker fairness is a guarantee, not an option (batch
+        # 2e, R3): the reserved verification channel exists only
+        # when the operator configures the boundary credential —
+        # without it, forged worker tokens spend the shared
+        # verification budget and a rotating worker's first
+        # verification starves behind the flood. A production
+        # worker composition therefore REQUIRES the credential;
+        # the worker transport presents it on every queue
+        # request (worker_remote.RemoteQueue).
+        if worker_boundary_key_from_env() is None:
+            raise ValueError(
+                "AIQS_SI_WORKER_BOUNDARY_KEY must be configured for a "
+                "production worker composition")
+        _enforce_policy_coherence(store)
     if billing is not None and billing.store is not store:
         raise ValueError('Billing and account store must match')
     onboarding = None

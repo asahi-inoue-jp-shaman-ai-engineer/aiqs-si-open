@@ -7,7 +7,7 @@ export default defineConfig({
     emptyOutDir: false,
     lib: {
       entry: fileURLToPath(new URL('./src/unified-entry-view.js', import.meta.url)),
-      name: 'SiUnifiedEntry', formats: ['iife'], fileName: () => 'si-unified-entry.js',
+      name: 'SiUnifiedEntry', formats: ['iife'], fileName: () => 'si-unified-entry-v3.js',
     },
   },
 });

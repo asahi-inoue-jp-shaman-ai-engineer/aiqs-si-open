@@ -200,10 +200,34 @@ if (root) {
     });
     addEventListener('pagehide', () => { stopGuidanceTimer(); entry.dispose(); clearInputs(); choices = []; selected = null; }, { once: true });
     render();
-  } catch {
-    entry?.dispose(); clearInputs();
-    root.querySelectorAll('button').forEach(button => { button.disabled = true; });
-    status.textContent = '画面を準備できませんでした。接続元のAIからやり直してください。';
-    element('si-existing-restart').hidden = false;
+  } catch (error) {
+    // Initialization failed (runtime configuration mismatch,
+    // template/view drift, a rejected handoff form): without a
+    // controller nothing on this screen can work, so do not freeze
+    // every control in silence. Say plainly that preparation
+    // failed and offer the one action that can still recover —
+    // reloading the page — as a real, enabled button. Controls
+    // that cannot work stay disabled and their forms are hidden;
+    // nothing is presented as usable when it is not.
+    console.error('si-unified-entry: initialization failed', error);
+    entry?.dispose(); stopGuidanceTimer(); clearInputs();
+    for (const id of ['si-entry-modes', 'si-otp-request', 'si-otp-verify', 'si-signup-form',
+                      'si-verify-form', 'si-retry-complete', 'si-recovery-request',
+                      'si-recovery-verify', 'si-totp-choice', 'si-totp-verify',
+                      'si-password-change', 'si-existing-restart']) {
+      const node = element(id);
+      if (node) node.hidden = true;
+    }
+    root.querySelectorAll('button, select, input').forEach(control => { control.disabled = true; });
+    status.textContent = '画面の準備に失敗しました。再読み込みしてもう一度お試しください。';
+    const initError = element('si-init-error');
+    if (initError) {
+      initError.hidden = false;
+      const reload = element('si-init-reload');
+      if (reload) {
+        reload.disabled = false;
+        reload.addEventListener('click', () => { location.reload(); });
+      }
+    }
   }
 }

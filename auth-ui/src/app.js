@@ -21,7 +21,8 @@ import { sessionChargeCredits } from './app-price.js';
 import { createPoller } from './app-poll.js';
 import {
   displayedRankingEntries, elapsedText, notifyWaitTextFor, proofHeadline,
-  progressCountText, rankingCountText, stageTextFor, waitMailNoteFor,
+  progressCountText, progressTitleFor, rankingCountText, stageTextFor,
+  waitMailNoteFor,
 } from './app-wait.js';
 import { normalizePhotoFile } from './app-image.js';
 import {
@@ -474,7 +475,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       </div>
 
       <div id="screen-progress" hidden>
-        <h2>照射中</h2>
+        <h2 id="progress-title">照射</h2>
         <div class="pulse-orb" aria-hidden="true"></div>
         <p id="progress-text">照射を実行しています。</p>
         <p class="note" id="progress-count" role="status"></p>
@@ -630,7 +631,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     confirmationScanId: null, confirmationGeneration: 0,
     currentScreen: null,
     scanKey: null, targetKey: null, irradiateKey: null, proofJob: null,
-    targetsGeneration: 0, proofStep: null,
+    targetsGeneration: 0, proofStep: null, waitStep: null, progressStep: null,
     guideReturn: 'home',
     readingKey: null, readingConfirmation: null, currentReading: null,
     referral: null,
@@ -814,11 +815,21 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     }
     syncNavBack(name);
     for (const screen of SCREENS) element('screen-' + screen).hidden = screen !== name;
+    syncStepLabel(name);
+  }
+  // The step label for the stateful screens derives from the
+  // job state the flow last recorded (batch 2e, R7): proof from
+  // its job, wait/progress from theirs, the wait-method pair
+  // from the flow context. Poll renders call this again as the
+  // state moves, so the label never stays at the entry claim.
+  function syncStepLabel(name) {
     const step = element('app-step');
     const label = name === 'proof' ? stepLabelFor('proof', state.proofStep)
-      : (name === 'wait-method' || name === 'notify-wait')
-        ? stepLabelFor(name, state.waitMethod)
-        : stepLabelFor(name);
+      : name === 'wait' ? stepLabelFor('wait', state.waitStep)
+        : name === 'progress' ? stepLabelFor('progress', state.progressStep)
+          : (name === 'wait-method' || name === 'notify-wait')
+            ? stepLabelFor(name, state.waitMethod)
+            : stepLabelFor(name);
     step.hidden = !label;
     step.textContent = label || '';
   }
@@ -3014,6 +3025,10 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   function enterScanWait(data) {
+    // The step label derives from the recorded state from the
+    // first render (batch 2e, R7): set the context BEFORE the
+    // navigation renders it, and refresh it on every poll.
+    state.waitStep = { state: data.state || 'unknown' };
     navigate('wait');
     element('wait-title').textContent = 'スキャンを受け付けました';
     // Stage text and the elapsed clock render synchronously on
@@ -3041,6 +3056,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     startElapsed('wait-elapsed');
     pollJob(data.job_id,
       (view) => {
+        state.waitStep = { state: view.state };
+        syncStepLabel('wait');
         element('wait-text').textContent = stageTextFor(view, 'スキャン');
         // The closing note is recomputed from EVERY received
         // view, not just the entry render (combined review
@@ -3563,7 +3580,15 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   function beginIrradiationProgress(data, record = null) {
+    // Heading and step label derive from the recorded state
+    // from the first render (batch 2e, R7): the context is set
+    // BEFORE the navigation renders the step label, and the
+    // heading is stamped here and on every poll — a queued or
+    // unknown job never opens under a fixed 照射中 claim.
+    state.progressStep = { state: data.state || 'unknown' };
     navigate('progress');
+    element('progress-title').textContent =
+      progressTitleFor(state.progressStep.state);
     element('progress-bar').style.width = '0%';
     // The entry sentence derives from the submission response's
     // own state (#7): a running job says so, a replayed terminal
@@ -3600,6 +3625,9 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     startElapsed('progress-elapsed');
     status('照射受付済み');
     const renderProgress = (view) => {
+      state.progressStep = { state: view.state };
+      syncStepLabel('progress');
+      element('progress-title').textContent = progressTitleFor(view.state);
       // A missing completed_count stays unreported (#7): the
       // count text keeps "—" and no percentage is derived.
       const done = view.execution?.completed_count ?? null;
