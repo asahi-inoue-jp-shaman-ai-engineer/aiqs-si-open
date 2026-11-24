@@ -170,15 +170,22 @@ function readHandoffState(store) {
 // The single write every arming transition is made of: the
 // nonce and its expectation land together or not at all. A
 // failed write leaves the previous state — legacy or record —
-// completely intact (batch 2f). After a successful write the
+// completely intact (batch 2f). The write is a COMMIT and is
+// verified by reading it back (batch 2i — the same class as
+// batch 2h F3 on the app side): a setItem that neither throws
+// nor stores must not report a landed arm, or callers would
+// hand out a nonce no record attests and record carry
+// expectations that do not exist. After a verified write the
 // legacy keys are swept best-effort: the record takes
 // precedence on every read, so a surviving legacy key is inert
 // (and consumption removes the legacy keys before the record).
 function writeHandoffState(store, nonce, carry) {
   const stored = carryToStored(carry);
   if (stored === undefined) return false;
+  const serialized = JSON.stringify({ nonce, carry: stored });
   try {
-    store.setItem(RECORD_KEY, JSON.stringify({ nonce, carry: stored }));
+    store.setItem(RECORD_KEY, serialized);
+    if (store.getItem(RECORD_KEY) !== serialized) return false;
   } catch { return false; }
   sweepLegacyHandoffKeys(store);
   return true;
@@ -189,16 +196,49 @@ function sweepLegacyHandoffKeys(store) {
   try { store.removeItem(HANDOFF_KEY); } catch { /* record takes precedence */ }
 }
 
-// Remove the handoff state, legacy keys first and the record
-// last: a failure at any step leaves the authoritative record
-// untouched (or, once the legacy keys are gone, the record
-// still holding the whole state), so consumption either
-// completes or has not happened — the nonce and its
-// expectation can never be left separated (batch 2f).
+// Remove the handoff state in the one order that can never
+// separate a nonce from its expectation, confirming each
+// removal by reading the key back BEFORE the next key is
+// touched (batch 2i, Astra batch2h diff review blocker 1 and
+// batch 2i round 1). The danger state is a bare legacy nonce:
+// with no expectation and no record it authenticates any
+// claim. The keys therefore come down as:
+//   1. the legacy nonce key — while the expectation and the
+//      record still stand, a nonce whose removal cannot be
+//      confirmed stays bound; aborting here changes nothing;
+//   2. the record — it binds nonce and expectation inside
+//      itself, so once the legacy nonce is confirmed gone, a
+//      record whose removal cannot be confirmed still keeps
+//      its nonce bound; aborting here leaves the record alone
+//      preserving the association;
+//   3. the expectation key — with both nonce carriers
+//      confirmed gone, an expectation whose removal cannot
+//      be confirmed is inert: no nonce remains for it to bind.
+// Verifying only after all three removals (the first shape of
+// this fix) detected a silently ignored legacy-nonce removal
+// too late: the record was already deleted and the surviving
+// nonce stood bare, replayable against a later account's
+// session. A removeItem that neither throws nor removes — a
+// silently ignoring store — now fails the consumption at the
+// first unconfirmed key, and with it the adoption that
+// required it. A store whose reads lie is outside this check,
+// as it is for every read-back in the module: claim
+// verification itself trusts reads.
+function handoffKeyAbsent(store, key) {
+  let raw;
+  try { raw = store.getItem(key); } catch { return false; }
+  return raw === null || raw === undefined;
+}
+
+function removeHandoffKey(store, key) {
+  try { store.removeItem(key); } catch { return false; }
+  return handoffKeyAbsent(store, key);
+}
+
 function removeHandoffState(store) {
-  try { store.removeItem(CARRY_KEY); } catch { return false; }
-  try { store.removeItem(HANDOFF_KEY); } catch { return false; }
-  try { store.removeItem(RECORD_KEY); } catch { return false; }
+  if (!removeHandoffKey(store, HANDOFF_KEY)) return false;
+  if (!removeHandoffKey(store, RECORD_KEY)) return false;
+  if (!removeHandoffKey(store, CARRY_KEY)) return false;
   return true;
 }
 
@@ -298,9 +338,11 @@ export function takeFragmentHandoff(location, history, storage, persistentStorag
   // Single-use is a hard condition, not best effort: if the
   // state cannot be consumed, the token is not adopted (it
   // would otherwise stay replayable). Consumption removes the
-  // legacy keys first and the record last, synchronously,
-  // before the token is processed, so a failure leaves the
-  // whole state intact rather than half of it (batch 2f).
+  // keys in the order documented at removeHandoffState —
+  // each removal confirmed before the next key is touched —
+  // synchronously, before the token is processed, so a
+  // failure can never separate the nonce from its
+  // expectation (batch 2f; ordering pinned in batch 2i).
   if (!removeHandoffState(store)) return null;
   // The fragment's binding claim: AT MOST ONE claim across all
   // three parameter kinds. Duplicates, coexistence and empty
@@ -339,18 +381,37 @@ export function takeFragmentHandoff(location, history, storage, persistentStorag
   // never to a second, independent read that could observe a
   // different state and bind the token to it.
   let lineage;
+  let identity;
   if (carried !== null) {
     const persistent = persistentStorage ?? defaultPersistentStorage();
     if (persistent) {
-      const currentBinding = verifiedSharedCarryBinding(persistent);
+      // Binding and identity from ONE derivation (batch 2i):
+      // the state the claim is validated against and the
+      // identity the destination binds the token to are the
+      // same observed state, never two reads that could
+      // observe different states.
+      const current = verifiedSharedIdentity(persistent);
+      if (current === null || current.state === 'unverifiable') {
+        return null;
+      }
+      const currentBinding = current.state === 'absent'
+        ? 'none' : current.binding;
       if (currentBinding === null) return null;
       if (!bindingsEqual(carried, currentBinding)) return null;
       lineage = currentBinding === 'none' ? null
         : currentBinding.sid ? { rev: null, sid: currentBinding.sid }
         : { rev: currentBinding.rev, sid: null };
+      identity = current.state === 'record'
+        ? {
+          state: 'record',
+          refreshToken: current.refreshToken,
+          rev: current.rev,
+          sid: current.sid,
+        }
+        : { state: 'absent' };
     }
   }
-  return { token: values[0], binding: carried, lineage };
+  return { token: values[0], binding: carried, lineage, identity };
 }
 
 export function takeFragmentToken(location, history, storage, persistentStorage) {
@@ -687,6 +748,40 @@ export function verifiedSharedCarryBinding(persistentStorage) {
   return derived.binding;
 }
 
+// The shared state as ONE identity (batch 2i): classification,
+// refresh token, revision, lineage and binding from a single
+// pass of the one derivation. The carry binding and the app
+// snapshot are projections of deriveSharedState; this is the
+// projection the ACCOUNT supply fence compares whole, the
+// way the app's fence compares its snapshot identity — token
+// value included (batch 2g round 2 on the app side; batch 2h
+// F1 made that clause unconditional there). The account fence
+// used to compare only the lineage projection ({rev, sid}),
+// so a session record that copied the adopted tombstone's
+// rev/sid and carried a foreign refresh token passed it and
+// the fragment token kept being served under a session it
+// never belonged to (Astra batch2h diff review, blocker 2 —
+// F1's account-side counterpart). Returns null when there is
+// no persistent storage at all; otherwise { state: 'absent' },
+// { state: 'unverifiable' }, or { state: 'record',
+// refreshToken, rev, sid, binding } (binding null for the one
+// shape that names none — see deriveSharedState).
+export function verifiedSharedIdentity(persistentStorage) {
+  if (!persistentStorage) return null;
+  const derived = deriveSharedState(persistentStorage);
+  if (derived.classification === 'absent') return { state: 'absent' };
+  if (derived.classification === 'unverifiable') {
+    return { state: 'unverifiable' };
+  }
+  return {
+    state: 'record',
+    refreshToken: derived.refreshToken,
+    rev: derived.rev,
+    sid: derived.sid,
+    binding: derived.binding,
+  };
+}
+
 // The binding the carrying side writes under (batch 2f): the
 // VERIFIED derivation, so a shared state that cannot be read
 // back stops the carry instead of being named 'none' here and
@@ -764,44 +859,25 @@ function defaultPersistentStorage() {
   try { return globalThis.localStorage ?? null; } catch { return null; }
 }
 
-// The lineage read WITH its readability (batch 2f round 3;
-// derivation unified onto the verified binding in the batch
-// 2f additional round): the lenient reader this replaced
-// collapsed a throwing read and an unparseable present value
-// into the same null as confirmed absence, which let an
-// adopted 'none' carry keep serving its token while the
-// shared state could not be read at all — the fence must
-// treat unreadable as unverifiable and retire, exactly as
-// adoption does. Round 3's tri-state reader still parsed the
-// records ITSELF, and its shape interpretation disagreed with
-// the verified derivation twice: a stored JSON 'null' literal
-// read as confirmed absence here but as unreadable in
-// readSharedRecord, and a bare {"refreshToken": ...} record
-// read as the empty lineage {rev: null, sid: null} here but
-// as unverifiable there, so a token bound to that emptiness
-// was served indefinitely. The fence therefore derives from
-// verifiedSharedCarryBinding — the one derivation adoption
-// validates against — and projects the binding to a lineage
-// in exactly the shape takeFragmentHandoff snapshots (the
-// sid, or the revision for a legacy record without one):
-// no fence-side parsing, no second classification. A state
-// the verified derivation cannot classify is 'unreadable'
-// here too. No storage at all is a deployment shape, not a
-// failure: lineage null, state ok. (Batch 2g removed the
-// lenient reader and its last caller outright: no surface
-// may derive shared state except through the verified
-// derivation and its projections.)
-function readSharedLineageState(persistentStorage) {
-  if (!persistentStorage) return { state: 'ok', lineage: null };
-  const binding = verifiedSharedCarryBinding(persistentStorage);
-  if (binding === null) return { state: 'unreadable' };
-  if (binding === 'none') return { state: 'ok', lineage: null };
-  return {
-    state: 'ok',
-    lineage: binding.sid
-      ? { rev: null, sid: binding.sid }
-      : { rev: binding.rev, sid: null },
-  };
+// The lineage projection of a shared-state identity (batch
+// 2i; the tri-state reader this replaces projected the same
+// shape from verifiedSharedCarryBinding since the batch 2f
+// additional round): the sid, or the revision for a legacy
+// record without one — exactly the shape takeFragmentHandoff
+// snapshots. Confirmed absence and no storage at all project
+// to a null lineage. A state that cannot be classified, or a
+// record naming no binding, projects to undefined: the fence
+// treats both as unreadable and retires, exactly as adoption
+// refuses them — a record naming no binding must not collapse
+// into the same null lineage as confirmed absence, behind
+// which a token bound to that emptiness was once served
+// indefinitely (batch 2f round 3).
+function lineageOfIdentity(identity) {
+  if (identity === null || identity.state === 'absent') return null;
+  if (identity.state !== 'record' || !identity.binding) return undefined;
+  return identity.binding.sid
+    ? { rev: null, sid: identity.binding.sid }
+    : { rev: identity.binding.rev, sid: null };
 }
 
 function lineageSuperseded(binding, current) {
@@ -835,29 +911,80 @@ export function createFragmentSession({
   // takeFragmentHandoff VERIFIED (batch 2e round 4, R1): an
   // independent re-read here could observe a state the claim
   // was never validated against and bind the token to it.
-  // External handoffs bind through the fence's own reader
-  // (batch 2f additional round): the snapshot and every later
-  // check are then the SAME verified derivation, so the
-  // snapshot can never be a value that derivation cannot
-  // produce — the collapsing reader's empty lineage
-  // {rev: null, sid: null}, behind which a later real lineage
-  // compared equal on the revision fallback and the token
-  // was never retired. A snapshot that cannot be verified
-  // binds the token to nothing servable: it retires at the
-  // first check, exactly as if the state had moved.
-  const snapshot = handoff && handoff.lineage !== undefined
-    ? { state: 'ok', lineage: handoff.lineage }
-    : readSharedLineageState(persistent);
-  const binding = snapshot.state === 'ok' ? snapshot.lineage : null;
+  // External handoffs bind through the fence's own reader:
+  // the snapshot and every later check are then the SAME
+  // verified derivation, so the snapshot can never be a value
+  // that derivation cannot produce — the collapsing reader's
+  // empty lineage {rev: null, sid: null}, behind which a later
+  // real lineage compared equal on the revision fallback and
+  // the token was never retired. A snapshot that cannot be
+  // verified binds the token to nothing servable: it retires
+  // at the first check, exactly as if the state had moved.
+  //
+  // Since batch 2i the binding snapshot is the state's whole
+  // IDENTITY — refresh token, revision and lineage from the
+  // one derivation — not the lineage alone (Astra batch2h
+  // diff review, blocker 2): the lineage comparison cannot
+  // see a session record that copies the captured rev/sid
+  // and carries a foreign refresh token, which is precisely
+  // the substitution the app side's unconditional token
+  // clause closed in batch 2h (F1). For a carried handoff
+  // the identity is the one takeFragmentHandoff verified in
+  // the same derivation that validated the claim; otherwise
+  // it is read once here, synchronously, in the same block
+  // as the adoption.
+  const capture = handoff && handoff.identity !== undefined
+    ? handoff.identity
+    : verifiedSharedIdentity(persistent);
+  const binding = handoff && handoff.lineage !== undefined
+    ? handoff.lineage
+    : lineageOfIdentity(capture);
   const current = () => {
     if (!token) return null;
-    if (snapshot.state !== 'ok') return null;
+    if (binding === undefined) return null;
+    if (!persistent) return token;
     // The fence is fail-closed about readability too (batch
     // 2f round 3): a shared state that cannot be read back
     // right now is unverifiable, not "still absent".
-    const state = readSharedLineageState(persistent);
-    if (state.state !== 'ok') return null;
-    if (lineageSuperseded(binding, state.lineage)) return null;
+    const now = verifiedSharedIdentity(persistent);
+    if (now === null || now.state === 'unverifiable') return null;
+    // A record appearing where none was captured, or an
+    // established record disappearing, retires the capture
+    // (batch 2i): appearance is a new lineage and
+    // disappearance is invalidation. The classification
+    // comparison also sees the shapes the lineage projection
+    // cannot — a record naming no binding projects to the
+    // same null lineage as confirmed absence.
+    if (capture && capture.state !== now.state) return null;
+    const nowLineage = lineageOfIdentity(now);
+    if (nowLineage === undefined) return null;
+    if (lineageSuperseded(binding, nowLineage)) return null;
+    if (capture && capture.state === 'record' && now.state === 'record') {
+      if (capture.refreshToken === null) {
+        // Bound to a tombstone (batch 2i): the shared state
+        // must still be EXACTLY that tombstone — same
+        // revision, same lineage, still no session record.
+        // A tombstone does not rotate, so no tolerance
+        // applies: any session record standing where it
+        // stood retires the token, even one copying the
+        // tombstone's rev/sid verbatim — the app side's
+        // unconditional token clause (batch 2h, F1) in the
+        // account fence's terms.
+        if (now.refreshToken !== null
+            || now.rev !== capture.rev
+            || now.sid !== capture.sid) return null;
+      } else if (now.rev === capture.rev
+          && now.refreshToken !== capture.refreshToken) {
+        // Same attested revision, different token (batch
+        // 2i): the record was replaced in place under a
+        // copied revision. A genuine rotation moves the
+        // revision together with the token in one commit
+        // and keeps the lineage, so it never trips this
+        // clause; the copied-revision substitution is
+        // exactly what does.
+        return null;
+      }
+    }
     return token;
   };
   return Object.freeze({
@@ -964,16 +1091,18 @@ export function installCarriedLinkRefresh({
     // The nonce dies with its carry expectation (batch 2e
     // round 4, R1): a fragment retained from before the
     // invalidation must not stay presentable afterwards. Since
-    // batch 2f the two are ONE record, removed after the
-    // legacy keys, so no failure ordering can leave a
-    // claim-strippable nonce armed without its expectation —
-    // a removal that cannot complete leaves the complete,
-    // still-verified state, never half of it. A legacy pair is
-    // migrated into the record before anything is deleted,
-    // and an unverifiable state is not deleted at all (batch
-    // 2f round 2): partial deletion of either could separate
-    // the pair, so when migration cannot land the whole state
-    // is simply left in place.
+    // batch 2f the two are ONE record; consumption removes the
+    // keys in the ordered, per-key-verified sequence documented
+    // at removeHandoffState (batch 2i), so no failure ordering
+    // can leave a claim-strippable nonce armed without its
+    // expectation — an unconfirmed removal stops the sequence
+    // with the nonce still bound (by the record, or by the
+    // surviving pair), and the worst case is an orphaned
+    // expectation, which reads as invalid and binds nothing.
+    // A legacy pair is migrated into the record before anything
+    // is deleted, and an unverifiable state is not deleted at
+    // all (batch 2f round 2): when migration cannot land the
+    // state is simply left in place.
     const store = storage ?? defaultStorage();
     if (store) {
       const state = readHandoffState(store);
