@@ -183,13 +183,9 @@ def validate_result_semantics(result, *, operation, state=None,
       publishes — sit above it as a matter of course. The
       field-selection stage ratio-normalizes its scores upward
       on top of that, and core.calculate_percentage is a
-      relative index that legitimately exceeds 100. Every one of
-      the 27 historical real device scans (cycles=88) exceeded
-      88 (peak hits 116-128), the glass post-release smoke scan
-      returned hits of 101-118, and the post-rollback recovery
-      scan returned 101-129, so the bound rejected every genuine
-      scan finish (glass release post-release check, 2026-11-24)
-      and was removed. Unlike the irradiation
+      relative index that legitimately exceeds 100. A bound of
+      hits <= cycles therefore rejects genuine scan finishes as
+      a matter of course and does not exist. Unlike the irradiation
       counts, hits have no server-side authoritative record to
       bind to; the finite bound that remains is the type
       schema's — hits must be a bounded integer (see

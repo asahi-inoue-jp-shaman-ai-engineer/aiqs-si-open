@@ -6,9 +6,10 @@ single device lane — from operator-measured effective durations
 presence. When any basis is missing the answer is null, never an
 invented figure.
 
-The device setting stamped into payloads (9 s/shot) is never the
-basis: the measured end-to-end cost of one shot is about 11 s, held
-in the policy. Synthetic fixtures only; the policy is injected.
+The device setting stamped into payloads is never the basis:
+the measured end-to-end cost of one shot is longer than the
+setting and is held in the policy. Synthetic fixtures only;
+the policy is injected.
 """
 import json
 import os

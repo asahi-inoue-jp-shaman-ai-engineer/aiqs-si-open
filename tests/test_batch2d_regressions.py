@@ -504,19 +504,16 @@ class ResultSemanticBindingTests(unittest.TestCase):
             reserved_count=3, progress_completed=2)
 
     def test_scan_finish_accepts_the_real_hits_distribution(self):
-        # Regression (glass release, 2026-11-24): the original
-        # MEDIUM 5 rule bounded an entry's hits by the configured
-        # cycle count, on the premise that hits are "resonated
-        # cycles". The engine's hits are draw counts (scan_pro
-        # makes N*cycles draws over N entries; an entry's expected
-        # hits EQUAL the cycle count and published top entries sit
-        # above it), so the rule rejected every genuine device
-        # scan: all 27 observed real results (cycles=88) carried
-        # hits above 88, the smoke scan's entries ran 101-118 and
-        # the post-rollback recovery scan 101-129. This fixture
-        # models that observed distribution with synthetic entries
-        # at the production cycle count; the finish must land and
-        # the hits must be stored unaltered.
+        # Regression: an earlier semantic rule bounded an entry's
+        # hits by the configured cycle count, on the premise that
+        # hits are "resonated cycles". The engine's hits are draw
+        # counts (scan_pro makes N*cycles draws over N entries; an
+        # entry's expected hits EQUAL the cycle count and published
+        # top entries sit above it), so such a bound rejects
+        # genuine device scans as a matter of course. This fixture
+        # models a distribution of that shape - top entries above
+        # the cycle count - with synthetic entries; the finish
+        # must land and the hits must be stored unaltered.
         import json
         import sqlite3
         real_shape_hits = [129, 118, 116, 111, 110, 109, 107, 107, 105, 101]
@@ -563,8 +560,8 @@ class ResultSemanticBindingTests(unittest.TestCase):
         from aiqs_si.result_schema import (validate_result_semantics,
                                            validate_worker_result)
         # Hits carry no cycle-count bound at the semantic layer:
-        # the real distribution (cycles=88, hits 101-129) passes,
-        # and no bound is invented for larger values either.
+        # a distribution whose top entries exceed the cycle count
+        # passes, and no bound is invented for larger values either.
         validate_result_semantics(
             {"scan": {"final_entries": [{"hits": 129}, {"hits": 10**6}]}},
             operation="scan")
