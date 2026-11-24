@@ -1,10 +1,35 @@
 """Private pull-worker API; never exposes user account or credit mutation tools."""
 import json
+import logging
+import time
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 WORKER_SCOPE = "aiqs:worker"
+
+logger = logging.getLogger(__name__)
+
+# Worker-contact recording is fail-soft telemetry (it must never
+# fail a claim), but a persistent failure should not be invisible:
+# log the exception TYPE at most once per interval — never tokens,
+# identities, or payloads.
+_CONTACT_LOG_INTERVAL_SEC = 300
+_last_contact_failure_log = None  # monotonic timestamp
+
+
+def _note_contact(store):
+    global _last_contact_failure_log
+    try:
+        store.note_worker_contact()
+    except Exception as error:  # telemetry only; see module note
+        now = time.monotonic()
+        if (_last_contact_failure_log is None
+                or now - _last_contact_failure_log
+                >= _CONTACT_LOG_INTERVAL_SEC):
+            _last_contact_failure_log = now
+            logger.warning("worker contact recording failed (%s)",
+                           type(error).__name__)
 
 
 def create_worker_app(store, verifier, *, allowed_subjects):
@@ -35,6 +60,13 @@ def create_worker_app(store, verifier, *, allowed_subjects):
                     claim_body = {}
                 job = store.claim_next(worker=identity,
                                        diode_serial_hash=claim_body.get("diode_serial_hash"))
+                # Presence evidence for the duration estimator: a
+                # claim just SUCCEEDED (a job, or a healthy empty
+                # queue), so the lane is known to be moving. Failed
+                # claims record nothing — a worker that can never
+                # claim must not keep the basis alive. Telemetry
+                # only: a contact failure never fails the claim.
+                _note_contact(store)
                 return JSONResponse({"job": job})
             body = await request.json()
             if not isinstance(body, dict):
@@ -69,6 +101,10 @@ def create_worker_app(store, verifier, *, allowed_subjects):
             if request.url.path == '/worker/heartbeat':
                 store.heartbeat(job_id, worker=identity,
                                 claim_generation=body.get("claim_generation"))
+                # A live execution heartbeat is also presence: the
+                # claim poll pauses while a job executes, which can
+                # far exceed the estimator's presence window.
+                _note_contact(store)
                 return JSONResponse({'ok': True})
             if request.url.path == "/worker/scan-receipt":
                 store.reconcile_scan_receipt(job_id, body['digest'], worker=identity,

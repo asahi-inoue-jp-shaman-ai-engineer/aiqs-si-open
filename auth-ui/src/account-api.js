@@ -19,12 +19,21 @@
 // (feature off) and their status-coded error bodies (400/403/409
 // with a fixed referral error code) ARE data the page maps to
 // specific messages.
-export function createAccountClient({ fetch, getToken }) {
+export function createAccountClient({ fetch, getToken, withToken }) {
   if (typeof fetch !== 'function' || typeof getToken !== 'function') {
     throw new Error('Account client unavailable');
   }
+  // withCurrentToken routing, as in the app client (batch 2d,
+  // HIGH 1 round 5): fence, selection and dispatch in one
+  // synchronous block when the auth layer offers it.
   async function call(path, options = {}) {
+    if (typeof withToken === 'function') {
+      return withToken((token) => dispatch(token, path, options));
+    }
     const token = await getToken();
+    return dispatch(token, path, options);
+  }
+  async function dispatch(token, path, options = {}) {
     if (!token) return { kind: 'login' };
     let response;
     try {

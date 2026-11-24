@@ -28,7 +28,7 @@ const STEP_LABELS = {
   wait: 'ステップ 3 / 5 — スキャン中',
   ranking: 'ステップ 4 / 5 — 結果',
   'reading-confirm': 'ステップ 4 / 5 — 結果（リーディングの確認）',
-  'reading-wait': 'ステップ 4 / 5 — 結果（リーディングを作成中）',
+  'reading-wait': 'ステップ 4 / 5 — 結果（リーディングを送信中）',
   'reading-result': 'ステップ 4 / 5 — 結果（リーディング）',
   count: 'ステップ 5 / 5 — 照射の回数',
   confirm: 'ステップ 5 / 5 — 照射の確認',
@@ -54,6 +54,17 @@ export function stepLabelFor(screen, context = null) {
   if (screen === 'notify-wait') {
     return context?.operation === 'irradiation'
       ? 'ステップ 5 / 5 — 通知まち' : 'ステップ 3 / 5 — 通知まち';
+  }
+  // The reading wait carries a phase, like the screens above
+  // carry theirs: 'creating' is claimable only after the server
+  // answered ACCEPTED (Astra gate #4); while the submission is
+  // still in flight the step must say 送信中, not 作成中 — the
+  // fixed label once asserted creation during the send phase
+  // (Antigravity glass audit, finding 1).
+  if (screen === 'reading-wait') {
+    return context === 'creating'
+      ? 'ステップ 4 / 5 — 結果（リーディングを作成中）'
+      : 'ステップ 4 / 5 — 結果（リーディングを送信中）';
   }
   return STEP_LABELS[screen] || null;
 }

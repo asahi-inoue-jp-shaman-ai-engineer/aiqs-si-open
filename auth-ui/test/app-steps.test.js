@@ -11,6 +11,13 @@ test('main flow screens carry their step position', () => {
   assert.match(stepLabelFor('scan-confirm'), /ステップ 2 \/ 5/);
   assert.match(stepLabelFor('wait'), /ステップ 3 \/ 5/);
   assert.match(stepLabelFor('ranking'), /ステップ 4 \/ 5/);
+  // The reading wait defaults to the sending claim; only the
+  // explicit 'creating' phase — reachable after the server
+  // answered ACCEPTED — may say 作成中 (Antigravity glass
+  // audit, finding 1).
+  assert.match(stepLabelFor('reading-wait'), /リーディングを送信中/);
+  assert.match(stepLabelFor('reading-wait', 'sending'), /リーディングを送信中/);
+  assert.match(stepLabelFor('reading-wait', 'creating'), /リーディングを作成中/);
   assert.match(stepLabelFor('count'), /ステップ 5 \/ 5/);
   assert.match(stepLabelFor('confirm'), /ステップ 5 \/ 5/);
   assert.match(stepLabelFor('progress'), /ステップ 5 \/ 5/);

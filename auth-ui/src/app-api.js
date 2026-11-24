@@ -43,12 +43,25 @@ import { createAttemptFence } from './app-lifecycle.js';
 // and releases the in-flight guard from its finally block.
 export const READING_SUBMISSION_TIMEOUT_MS = 20000;
 
-export function createAppClient({ fetch, getToken, readingTimeoutMs = READING_SUBMISSION_TIMEOUT_MS }) {
+export function createAppClient({ fetch, getToken, withToken, readingTimeoutMs = READING_SUBMISSION_TIMEOUT_MS }) {
   if (typeof fetch !== 'function' || typeof getToken !== 'function') {
     throw new Error('App client unavailable');
   }
+  // When the auth layer offers withCurrentToken, every call
+  // routes through it (batch 2d, HIGH 1 round 5): the token is
+  // selected and the request dispatched in one synchronous
+  // block after the final supersession fence, instead of a
+  // bearer string crossing the await below. The getToken-only
+  // path remains for compositions without the fence (tests and
+  // the standalone entry pages' provider).
   async function call(path, options = {}) {
+    if (typeof withToken === 'function') {
+      return withToken((token) => dispatch(token, path, options));
+    }
     const token = await getToken();
+    return dispatch(token, path, options);
+  }
+  async function dispatch(token, path, options = {}) {
     if (!token) return { kind: 'login' };
     const timeoutMs = typeof options.timeoutMs === 'number' && options.timeoutMs > 0
       ? options.timeoutMs : null;
@@ -153,6 +166,12 @@ export function createAppClient({ fetch, getToken, readingTimeoutMs = READING_SU
     reading: (readingId) => call('/api/app/readings/' + encodeURIComponent(readingId)),
     job: (jobId) => call('/api/app/jobs/' + encodeURIComponent(jobId)),
     cancelJob: (jobId) => call('/api/app/jobs/' + encodeURIComponent(jobId) + '/cancel',
+      { method: 'POST', body: {} }),
+    // The "I saw the result" ack (batch 2d, MEDIUM 6): the
+    // status GET no longer records a view, so the app sends
+    // this when a terminal result is actually rendered. The
+    // server records the view only for terminal jobs.
+    markViewed: (jobId) => call('/api/app/jobs/' + encodeURIComponent(jobId) + '/viewed',
       { method: 'POST', body: {} }),
     history: () => call('/api/app/history'),
     referral: () => call('/api/app/referral'),

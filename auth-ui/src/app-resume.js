@@ -103,20 +103,34 @@ const IN_FLIGHT_STATES = new Set(['queued', 'running', 'unknown']);
 
 // Where a redeemed resume lands, from the redeemed operation
 // and the job view's own reported state:
-//  - scan: completed → its ranking; anything else → its wait
-//    screen (whose polling surfaces a terminal failure
-//    through the ordinary path when one is already recorded).
+//  - scan: completed → its ranking; any other recognized
+//    state → its wait screen (whose polling surfaces a
+//    terminal failure through the ordinary path when one is
+//    already recorded).
+//    A completed scan whose content the 24-hour expiry already
+//    removed lands on 'expired' instead (batch 2d, MEDIUM 8):
+//    the ranking is gone, and rendering the empty ranking
+//    would present a success screen with no result in it.
+//    The resume link lives 7 days, the content 24 hours, so
+//    this is the COMMON case for a mail opened late.
 //  - irradiation: terminal → its proof; in flight → its
 //    progress screen.
 // An operation or state the client does not recognize earns
 // no landing (null) — the caller answers with the generic
 // "could not open" screen instead of guessing.
-export function resumeLandingFor({ operation, state } = {}) {
+const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
+
+export function resumeLandingFor({ operation, state, contentRemoved } = {}) {
   if (operation === 'scan') {
-    return state === 'completed' ? 'ranking' : 'scan-wait';
+    if (state === 'completed') return contentRemoved ? 'expired' : 'ranking';
+    if (IN_FLIGHT_STATES.has(state) || TERMINAL_STATES.has(state)) {
+      return 'scan-wait';
+    }
+    return null;
   }
   if (operation === 'irradiation') {
-    return IN_FLIGHT_STATES.has(state) ? 'progress' : 'proof';
+    if (IN_FLIGHT_STATES.has(state)) return 'progress';
+    return TERMINAL_STATES.has(state) ? 'proof' : null;
   }
   return null;
 }

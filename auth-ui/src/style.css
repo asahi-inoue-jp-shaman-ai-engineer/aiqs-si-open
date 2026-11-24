@@ -62,3 +62,710 @@ textarea{display:block;width:100%;border:1px solid #aab9b0;background:white;bord
 .history-record{border:1px solid #dce2da;border-radius:8px;padding:12px 16px;background:#fffefb;margin:12px 0}
 .history-record .history-open{width:100%;text-align:left}
 .history-record .note{margin:6px 0 0}
+
+/* ============================================================
+   案B イマーシブ・グラス — standalone app scope (2026-11-23)
+   Design source: files/ui-mock-oneq-v2 (PROPOSAL.md §4 案B).
+   Every rule is scoped to body.si-app, which only showApp()
+   sets, so the home / account surfaces sharing this stylesheet
+   are untouched. Component grammar is taken from the mock's
+   mapping table (DESIGN-NOTES.md): no new components — the
+   app's existing parts (buttons, .pairing summaries, .choice-btn
+   rows, .pack rows, the gear sheet, the progress bar, the orb)
+   are re-skinned in the glass grammar.
+   ============================================================ */
+body.si-app{
+  color-scheme:dark;
+  --bg:#04050e;
+  --ink:#f2f3ff;
+  --ink-2:rgba(226,230,255,.74);
+  --ink-3:rgba(226,230,255,.5);
+  --gold:#f2c979;
+  --gold-2:#ffe9b8;
+  --rose:#f3b8c6;
+  --aqua:#9be7ff;
+  --glass:rgba(255,255,255,.08);
+  --glass-strong:rgba(255,255,255,.13);
+  --glass-line:rgba(255,255,255,.2);
+  --solid:linear-gradient(155deg, rgba(23,28,58,.82), rgba(11,14,32,.88));
+  --solid-flat:rgba(13,17,38,.78);
+  background:#02030a;
+  color:var(--ink);
+  font-family:-apple-system,"Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans JP",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;
+  line-height:1.8;
+}
+/* Full-screen shell (checklist 69-77): the shell IS the
+   viewport; the page itself never scrolls — only .stage does. */
+body.si-app main{
+  position:fixed;inset:0;height:100vh;height:100dvh;max-width:none;margin:0;padding:0;
+  display:flex;flex-direction:column;overflow:hidden;
+  background:
+    radial-gradient(520px 380px at 88% -6%, rgba(150,110,255,.42), transparent 62%),
+    radial-gradient(640px 480px at -18% 34%, rgba(38,110,190,.34), transparent 60%),
+    radial-gradient(560px 420px at 108% 78%, rgba(220,120,170,.26), transparent 62%),
+    radial-gradient(900px 700px at 50% 115%, rgba(30,40,110,.5), transparent 65%),
+    var(--bg);
+}
+body.si-app main::before{
+  content:"";position:absolute;inset:0;pointer-events:none;z-index:0;opacity:.85;
+  background:
+    radial-gradient(1.6px 1.6px at 12% 16%, #fff, transparent 60%),
+    radial-gradient(1.1px 1.1px at 79% 9%, #dfe8ff, transparent 60%),
+    radial-gradient(1.3px 1.3px at 33% 58%, #fff, transparent 60%),
+    radial-gradient(1px 1px at 88% 40%, #ffe9b8, transparent 60%),
+    radial-gradient(1.2px 1.2px at 57% 82%, #cfe6ff, transparent 60%),
+    radial-gradient(1.5px 1.5px at 64% 24%, #fff, transparent 60%),
+    radial-gradient(1px 1px at 22% 88%, #fff, transparent 60%),
+    radial-gradient(1.1px 1.1px at 45% 11%, #fff, transparent 60%),
+    radial-gradient(1px 1px at 8% 46%, #e8dcff, transparent 60%),
+    radial-gradient(1.3px 1.3px at 93% 66%, #fff, transparent 60%),
+    radial-gradient(1px 1px at 70% 52%, #ffe9b8, transparent 60%),
+    radial-gradient(1.2px 1.2px at 28% 34%, #dfe8ff, transparent 60%);
+}
+/* --- app bar: back nav (left) + brand + gear (right) --- */
+body.si-app .appbar{
+  position:relative;z-index:55;flex:none;
+  display:flex;align-items:center;justify-content:space-between;
+  width:min(100%,480px);margin:0 auto;
+  padding:calc(env(safe-area-inset-top,0px) + 12px) 18px 8px;
+}
+body.si-app .appbar-left{display:flex;align-items:center;gap:10px;min-height:44px}
+body.si-app .appbar .brand{font-size:14px;font-weight:600;letter-spacing:.24em;color:var(--ink-2);text-decoration:none;padding-left:4px;min-height:44px;display:flex;align-items:center;gap:.55em}
+body.si-app .appbar .brand b{color:var(--ink);font-weight:700}
+body.si-app .glass-btn{
+  width:44px;height:44px;min-height:44px;padding:0;border-radius:50%;cursor:pointer;color:var(--ink);
+  background:var(--glass);border:1px solid rgba(255,255,255,.22);
+  backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);
+  box-shadow:0 8px 24px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.25) inset;
+  display:grid;place-items:center;
+  transition:transform .3s cubic-bezier(.34,1.56,.64,1);
+}
+body.si-app .glass-btn:active{transform:scale(.92)}
+body.si-app .glass-btn svg{width:20px;height:20px}
+body.si-app .nav-back{animation:si-nav-back-in .32s cubic-bezier(.34,1.56,.64,1)}
+body.si-app .nav-back svg{width:22px;height:22px}
+@keyframes si-nav-back-in{from{opacity:0;transform:scale(.78)}to{opacity:1;transform:scale(1)}}
+/* The gear button used to be a fixed circle of its own; in the
+   glass chrome it is the appbar's right glass button. */
+body.si-app .gear-button{position:static}
+/* --- stage: the one scrolling region --- */
+body.si-app .stage{
+  position:relative;z-index:2;flex:1;overflow-y:auto;overscroll-behavior:contain;
+  scrollbar-width:none;width:min(100%,480px);margin:0 auto;
+  padding:4px 24px calc(64px + env(safe-area-inset-bottom,0px));
+}
+body.si-app .stage::-webkit-scrollbar{display:none}
+body.si-app .stage>div[id^="screen-"]{animation:si-screen-in .45s cubic-bezier(.22,.9,.3,1)}
+@keyframes si-screen-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+body.si-app #app-title{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap}
+body.si-app #status{background:none;padding:0;margin:2px 0 0;text-align:center;font-size:12.5px;color:var(--ink-3)}
+body.si-app .step-indicator{margin:10px 0 0;text-align:center;font-size:11px;font-weight:600;letter-spacing:.3em;color:var(--gold)}
+/* --- floating glass dock --- */
+body.si-app .dock-zone{
+  position:relative;z-index:55;flex:none;width:min(100%,480px);margin:0 auto;
+  padding:10px 20px max(14px,calc(env(safe-area-inset-bottom,0px) + 6px));
+}
+body.si-app .dock-zone::before{
+  content:"";position:absolute;inset:-26px 0 0;z-index:-1;pointer-events:none;
+  background:linear-gradient(180deg,transparent,rgba(3,4,12,.55) 55%,rgba(3,4,12,.8));
+}
+body.si-app .dock{
+  width:100%;height:66px;border-radius:999px;display:flex;align-items:stretch;padding:6px;
+  background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(255,255,255,.07));
+  border:1px solid rgba(255,255,255,.24);
+  backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);
+  box-shadow:0 22px 48px rgba(0,0,0,.5),0 1px 0 rgba(255,255,255,.3) inset;
+}
+body.si-app .dock .item{
+  flex:1;width:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  border-radius:999px;color:var(--ink-3);font-size:10.5px;font-weight:500;letter-spacing:.06em;cursor:pointer;
+  background:none;border:none;min-height:44px;padding:0;box-shadow:none;
+  transition:background .3s ease,color .3s ease,box-shadow .3s ease;
+}
+body.si-app .dock .item svg{width:20px;height:20px}
+body.si-app .dock .item.on{
+  color:#23160a;font-weight:700;
+  background:linear-gradient(120deg,var(--gold-2),var(--gold));
+  box-shadow:0 6px 18px rgba(242,185,110,.4);
+  animation:si-dock-pop .38s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes si-dock-pop{0%{transform:scale(.88)}100%{transform:scale(1)}}
+/* --- type & text --- */
+body.si-app h2{font-size:23px;line-height:1.45;font-weight:700;letter-spacing:.01em;color:var(--ink);text-align:center;margin:10px 0 4px;word-break:auto-phrase;text-wrap:pretty}
+body.si-app h3{font-size:16px;line-height:1.5;color:var(--ink);margin:24px 0 6px;word-break:auto-phrase;text-wrap:pretty}
+body.si-app p{color:var(--ink-2)}
+/* Japanese line breaking (audit B MEDIUM-4, round 2):
+   auto-phrase keeps words and phrases intact (no mid-word
+   splits, no particle stranded at a line head) and
+   text-wrap:pretty avoids single-character orphan lines.
+   Round 1 applied this to <p> text only; round 2 extends it
+   to every text-bearing element B measured (h3 headings,
+   pairing values, history rows) — the breaks B found were
+   unapplied elements, not dictionary limits. Copy is never
+   edited to fix wrapping — layout only (D-1 / H-8). */
+body.si-app p,body.si-app .note,body.si-app .lead,body.si-app .choice-meta,body.si-app .pairing dd,body.si-app .history-open{
+  word-break:auto-phrase;text-wrap:pretty;
+}
+/* The intention screen's note (「共鳴の選定そのものには…」)
+   is set slightly smaller so the whole sentence fits on
+   one line at 390px and never has to break inside the
+   phrase — type size only, copy unchanged. (Audit B
+   round 2 prescribed 12.5px as the visual means; at
+   12.5px the sentence still wrapped inside そのもの, so
+   the size is 12px — the same means, sized to actually
+   clear the break. Measured: 12.5px wrapped at 222px of
+   the 342px column; 12px totals ≈327px, one line.) */
+body.si-app #screen-intention .note{font-size:12px;letter-spacing:.01em}
+body.si-app .lead{color:var(--ink-2);font-size:15px;line-height:1.85;text-align:center}
+body.si-app .note{font-size:13px;color:var(--ink-3);line-height:1.8}
+body.si-app .form-error{color:#ffb4a2}
+body.si-app a{color:var(--gold-2);text-underline-offset:4px}
+body.si-app footer{color:var(--ink-3);font-size:11.5px;text-align:center;margin-top:20px}
+body.si-app aside{border-top:none;margin-top:26px;padding-top:0}
+body.si-app #app-footnote{color:var(--ink-3);font-size:12px;text-align:center;line-height:1.8}
+/* centred waiting / entry screens */
+body.si-app #screen-login,body.si-app #screen-wait,body.si-app #screen-progress,
+body.si-app #screen-reading-wait,body.si-app #screen-notify-wait{text-align:center}
+body.si-app #screen-notify-wait p,body.si-app #screen-wait p,body.si-app #screen-progress p{text-align:center}
+/* --- buttons: primary gold pill / ghost glass pill --- */
+body.si-app .actions{flex-direction:column;align-items:stretch;gap:12px;margin:24px 0 8px}
+/* Sticky primary action (DESIGN-NOTES sticky-CTA grammar;
+   Astra gate #8): on a screen taller than the stage, the
+   action zone holding the screen's primary action pins to
+   the stage's bottom edge so the primary action stays
+   reachable while the details scroll beneath it; on a screen
+   that fits, the zone simply sits in flow (sticky engages
+   only past the threshold). Only a DIRECT-child action zone
+   of a screen qualifies, and only when it holds a primary
+   (non-secondary) button — preset rows, secondary-only zones
+   (purchase / wait-method / history), nested card actions
+   (the referral details) and the sheet's own zone never pin.
+   Zones marked .flow never pin either: those are the
+   multi-button utility zones (copy / guide / rescan / home)
+   of the reading screens (ranking / proof), whose job is to
+   be read — the whole zone sits in flow at the end of the
+   screen so it can never cover the content above it.
+   The fade under the zone keeps scrolled content from
+   colliding visually with the pinned buttons. */
+body.si-app .stage>div[id^="screen-"]>.actions:not(.flow):has(>button:not(.secondary)){
+  position:sticky;z-index:6;
+  /* The sticky scrollport ends at the stage's content box —
+     above its 64px + safe-area bottom padding — so the pin
+     offset goes negative by exactly that padding and the
+     zone comes to rest flush on the stage's lower edge,
+     directly above the dock (the mock's action-zone seat). */
+  bottom:calc(-64px - env(safe-area-inset-bottom,0px));
+  padding-top:12px;
+  background:linear-gradient(180deg,transparent,rgba(4,5,16,.66) 42%,rgba(4,5,16,.85));
+}
+body.si-app button{
+  min-height:56px;padding:16px 22px;border:none;border-radius:999px;cursor:pointer;
+  font-size:16px;font-weight:700;letter-spacing:.06em;color:#23160a;
+  background:linear-gradient(115deg,var(--gold-2) 0%,var(--gold) 42%,#eda9c0 100%);
+  box-shadow:0 14px 38px rgba(242,185,110,.42),0 0 30px rgba(255,215,150,.28),0 1px 0 rgba(255,255,255,.65) inset;
+  transition:transform .3s cubic-bezier(.34,1.56,.64,1),filter .25s ease;
+}
+body.si-app button:active{transform:scale(.965)}
+body.si-app button.secondary{
+  min-height:52px;background:var(--glass);border:1px solid rgba(255,255,255,.22);color:var(--ink);
+  font-weight:600;letter-spacing:.05em;
+  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
+  box-shadow:0 10px 26px rgba(0,0,0,.3),0 1px 0 rgba(255,255,255,.2) inset;
+}
+body.si-app button.secondary:active{transform:scale(.98)}
+body.si-app button:disabled{opacity:.45;cursor:wait;transform:none}
+body.si-app a.button-link{
+  border-radius:999px;border:1px solid transparent;color:#23160a;text-decoration:none;text-align:center;
+  background:linear-gradient(115deg,var(--gold-2),var(--gold) 55%,#eda9c0);
+  box-shadow:0 10px 26px rgba(242,185,110,.35);
+  font-weight:700;letter-spacing:.05em;
+}
+/* Secondary link-buttons take the ghost glass pill, never
+   the gold primary gradient (audit B HIGH-2: the account
+   screen's アカウントページ link rendered as a second
+   primary action). */
+body.si-app a.button-link.secondary{
+  min-height:52px;
+  background:var(--glass);
+  border:1px solid rgba(255,255,255,.22);
+  color:var(--ink);
+  font-weight:600;
+  backdrop-filter:blur(14px) saturate(150%);
+  -webkit-backdrop-filter:blur(14px) saturate(150%);
+  box-shadow:0 10px 26px rgba(0,0,0,.3),0 1px 0 rgba(255,255,255,.2) inset;
+}
+body.si-app a.button-link.secondary:active{
+  background:rgba(255,255,255,.16);
+  transform:scale(.98);
+}
+/* In-screen back controls are replaced by the appbar back
+   navigation (their handlers are what the appbar dispatches
+   to), so the design layer hides them. */
+body.si-app #account-back,body.si-app #purchase-back,body.si-app #target-back,
+body.si-app #targets-back,body.si-app #oq-photo-back,body.si-app #oq-name-back,
+body.si-app #oq-intention-back,body.si-app #oq-affirmation-back,body.si-app #oq-confirm-back,
+body.si-app #wait-method-back,body.si-app #reading-confirm-back,body.si-app #reading-back,
+body.si-app #count-back,body.si-app #confirm-back,body.si-app #history-back,
+body.si-app #guide-back{display:none}
+/* --- fields (solid surface rule for text-bearing inputs) --- */
+body.si-app label{color:var(--ink-2);font-size:13px;letter-spacing:.08em;margin:22px 0 0}
+body.si-app input,body.si-app textarea,body.si-app select{
+  background:var(--solid-flat);border:1px solid rgba(255,255,255,.18);color:var(--ink);
+  border-radius:16px;padding:16px;font-size:16.5px;line-height:1.7;margin-top:8px;
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  box-shadow:0 12px 28px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.12) inset;
+  transition:border-color .2s,box-shadow .2s;
+}
+body.si-app input:focus,body.si-app textarea:focus,body.si-app select:focus{
+  border-color:rgba(242,201,121,.7);box-shadow:0 0 0 3px rgba(242,201,121,.18),0 12px 28px rgba(0,0,0,.35);
+}
+body.si-app input[type="file"]{padding:12px 16px;font-size:16px}
+/* --- summary / proof pairings -> glass-solid summary card --- */
+body.si-app .pairing{
+  background:var(--solid);border:1px solid rgba(255,255,255,.16);border-radius:22px;
+  padding:6px 20px;margin:22px 0;
+  backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
+  box-shadow:0 20px 44px rgba(0,0,0,.5),0 1px 0 rgba(255,255,255,.18) inset;
+  animation:si-card-in .5s cubic-bezier(.22,1.25,.36,1) backwards;
+}
+body.si-app .pairing div{display:flex;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+body.si-app .pairing div:last-child{border-bottom:none}
+body.si-app .pairing dt{flex:0 0 auto;color:var(--ink-3);font-size:13px;padding-top:2px}
+/* text-wrap:pretty asks the engine to balance the final
+   line of wrapped values, so user-entered text on the
+   confirm screens (intention / affirmation) does not strand
+   a single trailing character on its own line; engines
+   without support simply ignore it. */
+body.si-app .pairing dd{margin:0 0 0 auto;text-align:right;color:var(--ink);font-size:15px;line-height:1.65;overflow-wrap:anywhere;text-wrap:pretty}
+/* Confirm cards (audit B MEDIUM-4): rows may wrap, and the
+   long user-text rows (intention / affirmation) stack
+   vertically — the 12-character dt otherwise starved the
+   value column to 8-9 characters and split words mid-way. */
+body.si-app #screen-scan-confirm .pairing div,
+body.si-app #screen-confirm .pairing div{
+  flex-wrap:wrap;gap:4px 16px;padding:10px 0;
+}
+body.si-app #screen-scan-confirm .pairing div:has(#oq-sum-affirmation),
+body.si-app #screen-confirm .pairing div:has(#confirm-intention),
+body.si-app #screen-confirm .pairing div:has(#confirm-affirmation){
+  flex-direction:column;align-items:stretch;gap:4px;
+}
+body.si-app #screen-scan-confirm #oq-sum-affirmation,
+body.si-app #screen-confirm #confirm-intention,
+body.si-app #screen-confirm #confirm-affirmation{
+  margin:0;text-align:left;
+}
+@keyframes si-card-in{from{opacity:0;transform:translateY(12px) scale(.98)}to{opacity:1;transform:none}}
+/* Home balance reads as the mock's balance card: the balance
+   value is the large number. */
+body.si-app #screen-home .pairing div:first-child dd{font-size:27px;font-weight:800;font-variant-numeric:tabular-nums;color:var(--ink)}
+body.si-app #screen-home .pairing div{align-items:center}
+/* --- choice rows --- */
+body.si-app .choice-list{display:flex;flex-direction:column;gap:12px;margin:22px 0}
+body.si-app .choice-btn{
+  display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:4px 16px;
+  width:100%;min-height:68px;padding:16px 18px;border-radius:22px;text-align:left;
+  color:var(--ink);font-weight:600;letter-spacing:.02em;
+  background:linear-gradient(150deg,var(--glass-strong),var(--glass) 55%,rgba(255,255,255,.05));
+  border:1px solid var(--glass-line);
+  backdrop-filter:blur(16px) saturate(155%);-webkit-backdrop-filter:blur(16px) saturate(155%);
+  box-shadow:0 14px 32px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.22) inset;
+  animation:si-card-in .5s cubic-bezier(.22,1.25,.36,1) backwards;
+}
+body.si-app .choice-btn:active{transform:scale(.985)}
+body.si-app .choice-name{font-size:16.5px;font-weight:600;line-height:1.45}
+body.si-app .choice-meta{font-size:12.5px;color:var(--ink-3);font-weight:500;flex:1 1 100%;line-height:1.6}
+/* --- pack rows (purchase packs & target manager rows) --- */
+body.si-app .pack-list{display:flex;flex-direction:column;gap:12px;margin:20px 0}
+body.si-app .pack{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:14px 18px;border-radius:22px;color:var(--ink);
+  background:linear-gradient(150deg,var(--glass-strong),var(--glass) 55%,rgba(255,255,255,.05));
+  border:1px solid var(--glass-line);
+  backdrop-filter:blur(16px) saturate(155%);-webkit-backdrop-filter:blur(16px) saturate(155%);
+  box-shadow:0 14px 32px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.22) inset;
+}
+body.si-app .pack-name{font-size:15.5px;font-weight:600}
+/* Purchase packs (audit B round 2, MEDIUM-4): the generic
+   .pack wrap let the row overflow its inner width by ~10px
+   and fold into a two-line stack; the purchase rows hold a
+   single nowrap line at 390px — name flexes, the link never
+   wraps or shrinks. */
+body.si-app #purchase-packs .pack{
+  flex-direction:row;flex-wrap:nowrap;align-items:center;justify-content:space-between;
+  gap:10px;padding:12px 14px;text-align:left;
+}
+body.si-app #purchase-packs .pack-name{
+  flex:1 1 0;min-width:0;font-size:14px;line-height:1.45;
+  word-break:auto-phrase;text-wrap:pretty;
+}
+body.si-app #purchase-packs .pack .button-link{
+  flex:0 0 auto;white-space:nowrap;min-height:44px;padding:10px 14px;font-size:13.5px;
+}
+body.si-app .pack .button-link{min-height:44px;padding:10px 18px;font-size:14px;display:inline-flex;align-items:center}
+body.si-app .pack button{min-height:44px;padding:10px 16px;font-size:14px}
+body.si-app #target-list{display:flex;flex-direction:column;gap:12px;margin:20px 0}
+body.si-app #target-list .pack input{flex:1 1 160px;margin-top:0}
+/* --- ranking --- */
+body.si-app #ranking-list{list-style:none;margin:20px 0;padding:0;display:flex;flex-direction:column;gap:10px;counter-reset:si-rank}
+body.si-app .ranking-item{
+  counter-increment:si-rank;display:flex;align-items:center;gap:13px;flex-wrap:wrap;row-gap:4px;
+  word-break:auto-phrase;text-wrap:pretty;
+  padding:13px 16px;border-radius:18px;color:var(--ink);font-size:14.5px;line-height:1.6;
+  background:linear-gradient(150deg,rgba(20,25,54,.72),rgba(11,14,32,.8));
+  border:1px solid rgba(255,255,255,.13);
+  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
+  box-shadow:0 10px 24px rgba(0,0,0,.32),0 1px 0 rgba(255,255,255,.14) inset;
+  animation:si-rank-in .6s cubic-bezier(.22,.9,.3,1) backwards;
+}
+body.si-app .ranking-item::before{
+  content:counter(si-rank);flex:none;width:30px;height:30px;border-radius:50%;
+  display:grid;place-items:center;font-size:14px;font-weight:800;font-variant-numeric:tabular-nums;
+  background:rgba(255,255,255,.09);color:var(--ink-2);
+  box-shadow:0 1px 0 rgba(255,255,255,.18) inset;
+}
+body.si-app .ranking-item:first-child{border-color:rgba(242,201,121,.4);background:linear-gradient(150deg,rgba(64,50,20,.55),rgba(16,18,40,.82))}
+body.si-app .ranking-item:first-child::before{background:linear-gradient(130deg,var(--gold-2),var(--gold));color:#23160a;box-shadow:0 0 14px rgba(242,201,121,.55)}
+body.si-app .ranking-item strong{font-weight:600;word-break:auto-phrase}
+@keyframes si-rank-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+/* --- history rows --- */
+body.si-app #history-list{display:flex;flex-direction:column;gap:10px;margin:20px 0}
+body.si-app .history-record{
+  margin:0;padding:14px;border-radius:20px;
+  background:linear-gradient(160deg,rgba(23,29,66,.55),rgba(10,13,30,.62));
+  border:1px solid rgba(255,255,255,.11);
+  box-shadow:0 14px 30px rgba(0,0,0,.3),0 1px 0 rgba(255,255,255,.1) inset;
+}
+body.si-app .history-record .history-open{
+  width:100%;min-height:44px;padding:2px 4px 10px;
+  background:none;border:none;box-shadow:none;border-radius:0;
+  backdrop-filter:none;-webkit-backdrop-filter:none;
+}
+body.si-app .history-record .note{color:var(--ink-2)}
+body.si-app .history-open{
+  width:100%;min-height:56px;padding:14px 16px;border-radius:18px;text-align:left;
+  font-size:14px;font-weight:500;letter-spacing:.01em;line-height:1.65;color:var(--ink);
+  background:linear-gradient(150deg,rgba(20,25,54,.72),rgba(11,14,32,.8));
+  border:1px solid rgba(255,255,255,.13);
+  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
+  box-shadow:0 10px 24px rgba(0,0,0,.32),0 1px 0 rgba(255,255,255,.14) inset;
+}
+body.si-app .history-open:active{transform:scale(.985)}
+body.si-app #history-list .note{margin:0 4px 6px}
+/* --- orb (waiting / entry screens) --- */
+body.si-app .pulse-orb{
+  width:116px;height:116px;margin:30px auto;
+  background:radial-gradient(circle at 36% 30%, #fffaf0, var(--gold-2) 26%, #eda9c0 56%, rgba(150,115,230,.25) 76%),
+             radial-gradient(circle, rgba(255,222,165,.95), rgba(205,135,195,.5) 60%, transparent 74%);
+  box-shadow:0 0 54px rgba(255,205,130,.6),0 0 130px rgba(190,120,220,.4),inset 0 0 30px rgba(255,255,255,.55);
+  animation:si-breathe 4.6s ease-in-out infinite;
+}
+/* Ring reach (audit B round 2, MEDIUM-4): inset -22px and
+   a maximum scale of 1.28 keep the halo's outer edge about
+   40px past the orb — inside the headroom the .pulse-orb
+   margins below reserve — so the halo never clips flat
+   against the stage's top edge and never touches the
+   status line above it. */
+body.si-app .pulse-orb::before,body.si-app .pulse-orb::after{
+  inset:-22px;border:none;border-radius:50%;
+  background:radial-gradient(circle, transparent 58%, rgba(190,205,255,.32) 74%, transparent 88%);
+  animation:si-ring 3.8s ease-out infinite;
+}
+body.si-app .pulse-orb::after{animation-delay:1.9s}
+@keyframes si-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.055)}}
+@keyframes si-ring{0%{transform:scale(.76);opacity:.8}100%{transform:scale(1.28);opacity:0}}
+body.si-app .skeleton-row{
+  background:linear-gradient(90deg,rgba(255,255,255,.06) 25%,rgba(255,255,255,.13) 50%,rgba(255,255,255,.06) 75%);
+  background-size:200% 100%;
+}
+/* --- progress (real state only; width is set from the server
+   job view by the existing renderer) --- */
+body.si-app .progress-track{height:10px;border-radius:6px;background:rgba(255,255,255,.1);box-shadow:0 1px 0 rgba(255,255,255,.1) inset;margin:18px 0}
+body.si-app .progress-bar{
+  border-radius:6px;
+  background:linear-gradient(90deg,var(--gold),var(--rose),var(--aqua));
+  box-shadow:0 0 14px rgba(242,185,160,.55);
+  transition:width .5s ease;
+}
+/* --- count slider + presets --- */
+body.si-app .count-now{text-align:center;font-size:19px;color:var(--ink-3);font-weight:600;margin:16px 0 4px}
+body.si-app #count-now{font-size:54px;font-weight:800;color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:.03em}
+/* The input box IS the interaction area (Astra gate #9):
+   it stands 44px tall — the minimum tap target — while the
+   visible track stays a 12px band painted centred by the
+   background layers (fill layer sized by --fill, base layer
+   full width). The thumb keeps its 32px visual size; the
+   real area and the visual size are deliberately separate. */
+body.si-app input[type="range"]{
+  -webkit-appearance:none;appearance:none;width:100%;height:44px;border-radius:0;
+  margin-top:10px;padding:0;cursor:pointer;border:none;box-shadow:none;
+  /* The generic input rule's box-shadow / capsule frame must
+     not survive here (audit B MEDIUM-4): the box is only the
+     44px interaction area; the visible 12px track is painted
+     by the background layers alone. The layers are written
+     as background-image / -size / -position longhands
+     (audit B round 2): in the shorthand form the plain
+     colour layer was parsed as background-color and painted
+     the whole 44px box as a dark rectangle. */
+  background-color:transparent;
+  background-image:
+    linear-gradient(90deg,var(--gold),var(--rose)),
+    linear-gradient(rgba(255,255,255,.14),rgba(255,255,255,.14));
+  background-position:left center,left center;
+  background-size:var(--fill,33%) 12px,100% 12px;
+  background-repeat:no-repeat,no-repeat;
+  backdrop-filter:none;-webkit-backdrop-filter:none;
+}
+body.si-app input[type="range"]::-moz-range-track{height:12px;border-radius:7px;background:rgba(255,255,255,.1)}
+body.si-app input[type="range"]::-moz-range-progress{height:12px;border-radius:7px;background:linear-gradient(90deg,var(--gold),var(--rose))}
+body.si-app input[type="range"]:focus-visible{outline:3px solid var(--gold);outline-offset:6px}
+body.si-app input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none;appearance:none;width:32px;height:32px;border-radius:50%;cursor:pointer;
+  background:radial-gradient(circle at 34% 30%,#fff8e6,var(--gold) 72%);border:2px solid rgba(255,240,205,.85);
+  box-shadow:0 0 20px rgba(242,201,121,.7);transition:transform .15s ease;
+}
+body.si-app input[type="range"]:active::-webkit-slider-thumb{transform:scale(1.18)}
+body.si-app input[type="range"]::-moz-range-thumb{
+  width:30px;height:30px;border-radius:50%;cursor:pointer;
+  background:radial-gradient(circle at 34% 30%,#fff8e6,var(--gold) 72%);border:2px solid rgba(255,240,205,.85);
+  box-shadow:0 0 20px rgba(242,201,121,.7);transition:transform .15s ease;
+}
+body.si-app input[type="range"]:active::-moz-range-thumb{transform:scale(1.18)}
+body.si-app .actions:has(> .preset){flex-direction:row;gap:10px}
+body.si-app .actions .preset{
+  flex:1;min-height:64px;padding:12px 6px 11px;border-radius:18px;
+  font-size:14.5px;letter-spacing:.08em;color:var(--ink-2);
+}
+body.si-app .actions .preset.active{
+  border-color:rgba(242,201,121,.75);color:var(--gold-2);
+  background:linear-gradient(120deg,rgba(242,201,121,.22),rgba(237,169,192,.12));
+  box-shadow:0 0 20px rgba(242,201,121,.25);
+  animation:si-preset-pop .32s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes si-preset-pop{0%{transform:scale(.93)}100%{transform:scale(1)}}
+/* --- gear sheet (bottom sheet grammar) --- */
+body.si-app .gear-sheet{z-index:80;background:rgba(2,3,10,.55);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+body.si-app .gear-panel{
+  background:linear-gradient(165deg, rgba(30,36,72,.92), rgba(11,14,32,.96));
+  border:1px solid rgba(255,255,255,.2);border-radius:28px;
+  margin:10px;width:calc(100% - 20px);max-height:calc(100dvh - 20px);
+  padding:14px 20px calc(20px + env(safe-area-inset-bottom,0px));
+  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
+  box-shadow:0 -18px 60px rgba(0,0,0,.55),0 1px 0 rgba(255,255,255,.22) inset;
+  animation:si-sheet-up .45s cubic-bezier(.32,1.3,.4,1);
+}
+/* Sheet handle (Astra gate #10): a flat uniform fill read as
+   cheap — the handle takes a horizontal light gradient with
+   an inner top highlight and a soft drop shadow instead. */
+body.si-app .gear-panel::before{
+  content:"";display:block;width:40px;height:5px;border-radius:3px;margin:0 auto 14px;
+  background:linear-gradient(90deg,rgba(255,255,255,.13),rgba(255,255,255,.42) 50%,rgba(255,255,255,.13));
+  box-shadow:0 1px 0 rgba(255,255,255,.22) inset,0 1px 3px rgba(0,0,0,.35);
+}
+body.si-app .gear-panel h2{font-size:13px;letter-spacing:.26em;color:var(--gold);text-align:left;margin:0 0 12px}
+@keyframes si-sheet-up{from{transform:translateY(38px);opacity:0}to{transform:none;opacity:1}}
+/* --- gift overlay / update banner / sub banner --- */
+/* Gift notice is a true modal (audit B round 2,
+   NEW-HIGH-1): as an in-flow card it pushed the home screen
+   down until the home screen's own sticky action zone fired
+   and covered the balance and the orb. It now renders as a
+   centred column over a full-screen scrim; app.js inerts
+   the stage behind it while it is open (the gear-sheet
+   pattern), so the home screen can neither be covered nor
+   operated underneath. [hidden] still wins via the base
+   sheet's display:none!important. */
+body.si-app .gift-overlay{
+  position:fixed;inset:0;z-index:90;margin:0;border-radius:0;border:none;
+  display:flex;flex-direction:column;justify-content:center;align-items:center;
+  padding:24px;text-align:center;
+  background:rgba(4,5,14,.92);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+}
+body.si-app .gift-panel{
+  max-width:340px;width:100%;padding:28px 24px 22px;border-radius:24px;
+  background:linear-gradient(165deg, rgba(30,36,72,.96), rgba(11,14,32,.98));
+  border:1px solid rgba(242,201,121,.42);
+  box-shadow:0 24px 60px rgba(0,0,0,.65),0 1px 0 rgba(255,255,255,.22) inset;
+}
+body.si-app .gift-overlay #gift-text{color:var(--ink)}
+body.si-app .gift-overlay #gift-balance{color:var(--ink-2)}
+body.si-app .update-banner{
+  background:var(--solid);border:1px solid rgba(255,255,255,.16);border-radius:18px;color:var(--ink);
+  backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
+}
+body.si-app .sub-banner{
+  background:linear-gradient(150deg,rgba(64,50,20,.5),rgba(16,18,40,.82));
+  border:1px solid rgba(242,201,121,.38);border-radius:18px;color:var(--ink);
+  backdrop-filter:blur(16px) saturate(150%);-webkit-backdrop-filter:blur(16px) saturate(150%);
+}
+body.si-app .sub-banner-label{color:var(--gold)}
+body.si-app .sub-banner a{color:var(--gold-2)}
+/* --- reading / guide --- */
+body.si-app .reading-summary{
+  background:var(--solid-flat);border:1px solid rgba(255,255,255,.16);border-radius:18px;color:var(--ink);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  /* Long unbroken tokens must wrap, not push the stage into
+     horizontal scrolling (Astra gate #7). */
+  overflow-wrap:anywhere;
+}
+body.si-app #reading-text{color:var(--ink);line-height:1.9;white-space:pre-wrap;overflow-wrap:anywhere}
+body.si-app .guide-img{border:1px solid rgba(255,255,255,.16);border-radius:16px}
+body.si-app #referral-details summary{color:var(--gold-2)}
+/* --- shortage note on the purchase screen --- */
+body.si-app #purchase-shortage{
+  border-radius:18px;padding:14px 16px;
+  background:linear-gradient(150deg,rgba(64,42,10,.72),rgba(30,20,8,.8));
+  border:1px solid rgba(255,190,130,.45);color:#ffd9a8;
+}
+/* --- short effective viewports: tighten the rhythm (71) --- */
+@media (max-height:780px){
+  body.si-app h2{font-size:21px}
+  body.si-app .pulse-orb{width:96px;height:96px;margin:22px auto}
+  body.si-app .actions{margin-top:18px}
+  body.si-app .pairing{margin:16px 0}
+  body.si-app .pairing div{padding:11px 0}
+  body.si-app .choice-btn{min-height:62px;padding:13px 16px}
+  body.si-app #count-now{font-size:47px}
+}
+@media (max-height:690px){
+  body.si-app .pulse-orb{width:84px;height:84px;margin:16px auto}
+  body.si-app #count-now{font-size:42px}
+  body.si-app .stage{padding-top:2px}
+}
+@media (hover:hover) and (pointer:fine){
+  body.si-app button:hover{filter:brightness(1.06)}
+  body.si-app button.secondary:hover{filter:none;border-color:rgba(220,228,255,.45)}
+  body.si-app .choice-btn:hover{border-color:rgba(220,228,255,.42)}
+  body.si-app .glass-btn:hover{border-color:rgba(220,228,255,.45)}
+  body.si-app .dock .item:hover{color:var(--ink-2)}
+  body.si-app .dock .item.on:hover{color:#23160a}
+}
+@media (prefers-reduced-motion:reduce){
+  /* Universal kill-switch inside the app scope: enumerated
+     selectors kept losing on specificity to classed rules
+     (.actions .preset.active, button.secondary:active, the
+     range thumb), so motion is disabled wholesale instead.
+     State changes still apply — instantly, without movement. */
+  body.si-app *,body.si-app *::before,body.si-app *::after{
+    animation:none!important;transition:none!important;
+  }
+  body.si-app *:active{transform:none!important}
+  /* Vendor thumb pseudos are neither elements nor ::before/::after:
+     name them explicitly or the thumb keeps its press scale.
+     Each vendor pseudo gets its OWN rule (Astra gate #5): a
+     comma-joined selector list containing an unrecognized
+     vendor pseudo invalidates the whole rule in Chromium, so
+     combining ::-webkit-slider-thumb with ::-moz-range-thumb
+     silently voided both declarations there. */
+  body.si-app *::-webkit-slider-thumb{transition:none!important}
+  body.si-app *::-moz-range-thumb{transition:none!important}
+  body.si-app *:active::-webkit-slider-thumb{transform:none!important}
+  body.si-app *:active::-moz-range-thumb{transform:none!important}
+}
+
+/* --- 第2段階の棚卸し反映 (DESIGN-NOTES updated 2026-11-23) --- */
+/* 追加行: 選択肢行 (Card+Tabs) + Avatar メダリオン (plus) の合成。
+   The production target-add control takes the same shape as
+   the target choice rows, with the glass medallion carrying
+   the plus instead of a text prefix. */
+body.si-app #target-add{
+  display:flex;align-items:center;gap:14px;justify-content:flex-start;text-align:left;
+  min-height:68px;padding:12px 18px;border-radius:22px;
+  color:var(--ink);font-weight:600;letter-spacing:.02em;
+  background:linear-gradient(150deg,var(--glass-strong),var(--glass) 55%,rgba(255,255,255,.05));
+  border:1px solid var(--glass-line);
+  backdrop-filter:blur(16px) saturate(155%);-webkit-backdrop-filter:blur(16px) saturate(155%);
+  box-shadow:0 14px 32px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.22) inset;
+}
+body.si-app #target-add::before{
+  content:"+";flex:none;width:48px;height:48px;border-radius:50%;display:grid;place-items:center;
+  font-size:26px;font-weight:400;line-height:1;color:var(--gold-2);
+  background:linear-gradient(150deg,var(--glass-strong),var(--glass));
+  border:1px solid var(--glass-line);
+  box-shadow:0 1px 0 rgba(255,255,255,.22) inset;
+}
+body.si-app #target-add::after{content:"›";margin-left:auto;color:var(--ink-3);font-size:26px;line-height:1}
+body.si-app #target-add:active{transform:scale(.985)}
+/* テキストボタン (Material 3 Text Button): the one standalone
+   text control — the referral disclosure — gets the 44px tap
+   area and the pill state layer on press. The app's other
+   tertiary actions are ghost pills (52px+), which already
+   satisfy the tap-area side of the grammar; they gain the
+   same state layer on press. */
+body.si-app #referral-details summary{
+  display:inline-flex;align-items:center;min-height:44px;padding:10px 12px;border-radius:999px;
+  transition:background .2s ease,color .2s ease;
+}
+body.si-app #referral-details summary:active{background:rgba(255,255,255,.09);color:var(--ink)}
+body.si-app button.secondary:active{background:rgba(255,255,255,.16)}
+/* 残高不足バナー (Material 3 Banner): every shortage surface
+   takes the same amber banner, not just the purchase one. */
+body.si-app #confirm-insufficient,body.si-app #reading-confirm-insufficient{
+  border-radius:18px;padding:14px 16px;font-size:14px;line-height:1.85;
+  background:linear-gradient(150deg,rgba(64,42,10,.72),rgba(30,20,8,.8));
+  border:1px solid rgba(255,190,130,.45);color:#ffd9a8;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+}
+/* 経過表示 (Timer): elapsed readouts in tabular figures. */
+body.si-app #wait-elapsed,body.si-app #progress-elapsed,body.si-app #reading-wait-elapsed{
+  font-size:14px;color:var(--ink-2);letter-spacing:.1em;font-variant-numeric:tabular-nums;
+}
+/* 写真ピッカー (Picker): the label IS the trigger — a glass
+   tile in the mock's photo-pick surface grammar whose whole
+   face reads 「写真を選ぶ」. The native file input is
+   visually hidden inside it (audit B LOW-2): a bare
+   <input type="file"> leaks the browser's English
+   "Choose File / No file chosen" UI into the Japanese app.
+   The input stays label-associated and focusable, so the
+   OS picker still opens from tap, click and keyboard. */
+body.si-app .photo-pick{
+  display:flex;align-items:center;justify-content:center;min-height:76px;
+  margin:22px 0 0;padding:22px 16px;border-radius:22px;cursor:pointer;text-align:center;
+  color:var(--ink);font-size:16px;font-weight:600;letter-spacing:.05em;
+  background:linear-gradient(155deg,rgba(255,255,255,.1),rgba(255,255,255,.04));
+  border:1px solid rgba(255,255,255,.22);
+  box-shadow:0 18px 40px rgba(0,0,0,.4),0 0 30px rgba(155,180,255,.12),0 1px 0 rgba(255,255,255,.22) inset;
+  transition:transform .3s cubic-bezier(.34,1.56,.64,1);
+}
+body.si-app .photo-pick:active{transform:scale(.985)}
+body.si-app .photo-pick:has(> input:focus-visible){outline:3px solid var(--gold);outline-offset:3px}
+body.si-app .visually-hidden{
+  position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;
+}
+
+/* --- 監査B差し戻し修正 (2026-11-24, audit B MEDIUM-4 / HIGH-1) --- */
+/* .pack rows: the legacy light-theme sheet stacks .pack
+   vertically at <=480px; the glass scope restores the row
+   layout (the purchase packs and target rows are horizontal
+   rows in the 案B grammar) instead of inheriting the stack. */
+@media (max-width:480px){
+  body.si-app .pack{flex-direction:row;align-items:center;text-align:left}
+  body.si-app #target-list .pack{flex-wrap:wrap}
+}
+/* Orb headroom: the ring halo reaches about 40px past the
+   orb (inset:-22px at scale 1.28); the top margin plus the
+   status line above it must clear that or the halo clips
+   flat against the stage's top edge. Shorter viewports
+   tighten the rhythm but keep the clearance (audit B
+   round 2 values). */
+body.si-app .pulse-orb{margin:38px auto 28px}
+@media (max-height:780px){body.si-app .pulse-orb{margin:36px auto 20px}}
+@media (max-height:690px){body.si-app .pulse-orb{margin:34px auto 16px}}
+/* Count / confirm action zones (HIGH-1, audit B round 2):
+   the single-primary zones of the count, irradiation
+   confirm and scan confirm screens take their natural place
+   directly under the card at EVERY stage height — round 1
+   unpinned them only at <=700px, and at 844px the pinned
+   button still covered the price note's last line at first
+   paint. The same unpinning applies to the home screen's
+   action zone while the update banner is up, so the home
+   button can never pin over the balance or the orb. (The
+   gift modal needs no unpinning: it sits directly under
+   <main> above the whole stage — delta audit HIGH-1.) */
+body.si-app .stage>#screen-count>.actions:not(.flow),
+body.si-app .stage>#screen-confirm>.actions:not(.flow),
+body.si-app .stage>#screen-scan-confirm>.actions:not(.flow),
+body.si-app .stage:has(> #update-banner:not([hidden])) > #screen-home > .actions:not(.flow){
+  position:static;padding-top:0;background:none;
+}

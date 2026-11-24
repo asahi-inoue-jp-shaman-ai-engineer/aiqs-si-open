@@ -45,7 +45,7 @@ MAX_COUNT = 999999
 # the engine contract). The finish-time bound leaves an order of
 # magnitude of headroom for producers while keeping the entry
 # list, and every scalar in it, finitely sized.
-# hits is a resonance count (bounded like every other count — an
+# hits is a draw count (bounded like every other count — an
 # unbounded integer would be a covert channel: a whole catalog
 # digest fits in one), rank is a 1-based position that cannot
 # exceed the number of entries in its own list, and the serializer
@@ -148,3 +148,158 @@ def validate_worker_result(result):
         raise ValueError("Job result intention_usage is not a known value")
     if "entry_ids" in result and not isinstance(result["entry_ids"], list):
         raise ValueError("Job result entry_ids must be a list")
+
+
+def validate_result_semantics(result, *, operation, state=None,
+                              reserved_count=None,
+                              progress_completed=None):
+    """Semantic binding (batch 2d, MEDIUM 5): the type schema
+    above cannot see the job, so a well-typed result could still
+    LIE — a one-shot irradiation claiming requested_count=999999,
+    or physical_output_verified=true, a claim the server has no
+    mechanism to verify (the genuine workers always report False;
+    the proof bundle hardcodes False for the same reason). Called
+    by Store._finish with the job's authoritative records: the
+    reserved count from the job payload and the server-tracked
+    execution progress.
+
+    Rules:
+    - physical_output_verified=true is always rejected: no
+      server-side verification exists, so the claim is unprovable
+      by construction.
+    - Irradiation counts bind to the reservation: requested must
+      equal it, completed/simulated must not exceed it, and a
+      reported completed count must equal the server-tracked
+      progress whenever progress was recorded.
+    - Mode coherence: simulated shots exist only in synthetic
+      mode; physical execution exists only in hardware mode.
+    - Scan hits carry NO cycle-count bound. An earlier rule
+      assumed an entry's hits are "the number of scan cycles in
+      which it resonated"; the engine does not work that way.
+      Entry-stage hits are draw counts: scan_pro makes N*cycles
+      draws over a field's N entries and every draw lands on
+      exactly one entry, so an entry's expected hits EQUAL the
+      cycle count and the top entries — the ones a scan
+      publishes — sit above it as a matter of course. The
+      field-selection stage ratio-normalizes its scores upward
+      on top of that, and core.calculate_percentage is a
+      relative index that legitimately exceeds 100. Every one of
+      the 27 historical real device scans (cycles=88) exceeded
+      88 (peak hits 116-128), the glass post-release smoke scan
+      returned hits of 101-118, and the post-rollback recovery
+      scan returned 101-129, so the bound rejected every genuine
+      scan finish (glass release post-release check, 2026-11-24)
+      and was removed. Unlike the irradiation
+      counts, hits have no server-side authoritative record to
+      bind to; the finite bound that remains is the type
+      schema's — hits must be a bounded integer (see
+      validate_worker_result / MAX_COUNT), which is the
+      anti-covert-channel measure.
+    """
+    if result.get("physical_output_verified") is True:
+        raise ValueError(
+            "Job result physical_output_verified cannot be claimed: "
+            "the server has no physical-output verification mechanism")
+    mode = result.get("mode")
+    if operation == "irradiation" and reserved_count is not None:
+        if ("requested_count" in result
+                and result["requested_count"] != reserved_count):
+            raise ValueError(
+                "Job result requested_count does not match the reserved count")
+        for key in ("completed_count", "simulated_count"):
+            if key in result and result[key] > reserved_count:
+                raise ValueError(
+                    f"Job result {key} exceeds the reserved count")
+        if (progress_completed is not None
+                and "completed_count" in result
+                and result["completed_count"] != progress_completed):
+            raise ValueError(
+                "Job result completed_count does not match recorded progress")
+    if result.get("simulated_count"):
+        if mode != "synthetic":
+            raise ValueError(
+                "Job result simulated_count requires synthetic mode")
+    if result.get("executed_physically") is True and mode != "hardware":
+        raise ValueError(
+            "Job result executed_physically requires hardware mode")
+    if operation == "irradiation" and progress_completed is not None:
+        # Simulated execution is bound to the AUTHORITATIVE
+        # progress, not merely to the reservation (round 3): a
+        # cancelled finish claimed simulated shots the progress
+        # record says never ran, while the settlement refunded
+        # the whole reservation and the public view published
+        # the phantom count. On a synthetic device every
+        # completed shot is a simulated one, so the counts are
+        # equal there, not just bounded.
+        _simulated = result.get("simulated_count") or 0
+        if _simulated > progress_completed:
+            raise ValueError(
+                "Job result simulated_count exceeds the recorded execution progress")
+        if mode == "synthetic" and state in ("completed", "cancelled") \
+                and _simulated != progress_completed:
+            raise ValueError(
+                "Job result simulated_count does not match the recorded execution progress")
+    if operation == "irradiation" and state == "cancelled" \
+            and progress_completed is None:
+        # A cancelled finish with no progress record has no
+        # authoritative execution to claim against.
+        if result.get("completed_count") or result.get("simulated_count"):
+            raise ValueError(
+                "Job result for a cancelled irradiation without a "
+                "progress record cannot claim executed shots")
+    if operation == "irradiation" and state == "unknown" \
+            and progress_completed is None:
+        # An unknown finish is an UNCONFIRMED execution: with no
+        # progress record there is no authoritative execution to
+        # claim against (same reasoning as cancelled above), and
+        # publishing the worker's figures would present the
+        # reservation as executed shots the owner cannot verify.
+        if result.get("completed_count") or result.get("simulated_count"):
+            raise ValueError(
+                "Job result for an unknown irradiation without a "
+                "progress record cannot claim executed shots")
+        if result.get("executed_physically") is True:
+            raise ValueError(
+                "Job result for an unknown irradiation without a "
+                "progress record cannot claim physical execution")
+    if operation == "irradiation" and progress_completed == 0 \
+            and result.get("executed_physically") is True:
+        # Zero recorded progress means nothing executed, whatever
+        # the final state: a physical-execution claim would
+        # publish an execution the settlement treats as never
+        # having happened (the reservation is released in full).
+        raise ValueError(
+            "Job result with zero recorded execution progress "
+            "cannot claim physical execution")
+    if operation == "irradiation" and state == "failed":
+        # Final-state coherence (round 2): a FAILED irradiation
+        # is one the worker refused or could not start — the
+        # genuine failure results carry only a reason. A failed
+        # result that also claims executed shots would publish a
+        # physical execution the settlement treats as never
+        # having happened (the reservation is released in full).
+        # Executions whose outcome is genuinely uncertain travel
+        # as 'unknown', not 'failed'.
+        if result.get("completed_count") or result.get("simulated_count"):
+            raise ValueError(
+                "Job result for a failed irradiation cannot claim executed shots")
+        if result.get("executed_physically") is True:
+            raise ValueError(
+                "Job result for a failed irradiation cannot claim physical execution")
+    if operation == "irradiation" and state == "completed" \
+            and reserved_count is not None:
+        # A completed irradiation certifies the reserved total:
+        # with progress, the count must equal it (checked above);
+        # without any progress record, a reported count below the
+        # reservation — above all zero — must not take the
+        # completed settlement path, and an absent count has
+        # nothing to certify completion with.
+        if progress_completed is None:
+            if "completed_count" not in result:
+                raise ValueError(
+                    "Job result for a completed irradiation must report "
+                    "its completed count when no progress record exists")
+            if result["completed_count"] != reserved_count:
+                raise ValueError(
+                    "Job result completed_count does not match the reserved count")
+

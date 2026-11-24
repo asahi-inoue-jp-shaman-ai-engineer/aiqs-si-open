@@ -6,8 +6,9 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.auth.middleware.auth_context import get_access_token
 from .mcp_server import create_account_server
-from .deployment import production_environment
+from .deployment import production_environment, store_in_production
 from .notifications import plausible_email
+from .policies import enforce_policy_posture
 from mcp.server.transport_security import TransportSecuritySettings
 
 SCOPE = "aiqs:use"
@@ -137,8 +138,20 @@ def create_http_server(store, verifier, *, service=None, embedded_test_worker=No
         # The verifier's issuer is a production signal this layer can
         # see even when the deployment marker is absent: never let the
         # synthetic fallback service (or its embedded worker) be
-        # constructed behind the production issuer.
+        # constructed behind the production issuer. This guard runs
+        # BEFORE the posture gate below: it is the more specific
+        # refusal for this constructor, and the gate's error would
+        # otherwise mask it whenever both apply (the constructor
+        # gate tests pin the issuer message).
         raise ValueError("Production issuer requires hardware intake with a separate worker")
+    if store_in_production(store, url=verifier.issuer):
+        # Policy posture at this composition boundary too
+        # (batch 2d, MEDIUM 4): the MCP/account server assembled
+        # without the ASGI factory must not inherit the built-in
+        # default policies silently in production either. The
+        # store's own durable designation is a production signal
+        # here too (Antigravity glass audit, finding 7).
+        enforce_policy_posture()
     def current_owner():
         token = get_access_token()
         if not isinstance(token, UserAccessToken):

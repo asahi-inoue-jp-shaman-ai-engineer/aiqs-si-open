@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAppAuth } from '../src/app-auth.js';
+import { createAppClient } from '../src/app-api.js';
 
 function fixture({ search = '', responder } = {}) {
   const items = new Map();
@@ -344,4 +345,440 @@ test('a generation change during a deferred response body still discards the old
   // A's rotated refresh token was never persisted under B.
   assert.equal(persistent.has('si-app-session-v1'), false);
   assert.equal(auth.hasPersistedSession(), false);
+});
+
+
+test('cross-tab: a late refresh for the old account cannot resurrect it (batch 2d HIGH 1)', async () => {
+  // Astra's reproduction: tab 1 holds account A's persisted
+  // session and its refresh is in flight; tab 2 adopts account
+  // B from a fragment handoff (which clears the shared session);
+  // tab 1's slow response then lands. Before the fix it
+  // re-persisted A's rotated refresh token, and the next load
+  // silently restored A.
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, session, persistent, location } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      if (body.get('grant_type') === 'refresh_token'
+          && body.get('refresh_token') === 'refresh-a1') {
+        await gate;
+        return tokenResponse({
+          access_token: 'access-a2', refresh_token: 'refresh-a2',
+          expires_in: 3600,
+        });
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+  const tabA = make();
+  const pending = tabA.getToken();
+  // Let the refresh reach the (gated) token endpoint.
+  await new Promise((resolve) => setImmediate(resolve));
+  // Tab 2 adopts B through the state-bound fragment handoff.
+  const tabB = make();
+  const nonce = session.get('si-fragment-handoff-v1');
+  assert.ok(nonce);
+  location.hash = `#access_token=access-b&state=${nonce}`;
+  assert.equal(tabB.takeFragment(), true);
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  // Tab 1's response for A finally lands — and is discarded.
+  releaseRefresh();
+  assert.equal(await pending, null);
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  // A fresh tab finds no session to resurrect.
+  const tabC = make();
+  assert.equal(tabC.hasPersistedSession(), false);
+  assert.equal(await tabC.getToken(), null);
+});
+
+test('cross-tab: a rotation race resolves through the newer persisted token', async () => {
+  // Both tabs refresh with the same token; the loser of the
+  // race must not be signed out — it retries once with the
+  // winner's rotated token.
+  let releaseFirst;
+  const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  let firstCalls = 0;
+  const { make, persistent } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      const presented = body.get('refresh_token');
+      if (presented === 'refresh-1') {
+        firstCalls += 1;
+        if (firstCalls === 1) {
+          await gate;
+          return tokenResponse({
+            access_token: 'access-late', refresh_token: 'refresh-late',
+            expires_in: 3600,
+          });
+        }
+        return tokenResponse({
+          access_token: 'access-b2', refresh_token: 'refresh-2',
+          expires_in: 3600,
+        });
+      }
+      if (presented === 'refresh-2') {
+        return tokenResponse({
+          access_token: 'access-a3', refresh_token: 'refresh-3',
+          expires_in: 3600,
+        });
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-1', savedAt: 1 }));
+  const tabA = make();
+  const pendingA = tabA.getToken();
+  await new Promise((resolve) => setImmediate(resolve));
+  const tabB = make();
+  assert.equal(await tabB.getToken(), 'access-b2');
+  releaseFirst();
+  assert.equal(await pendingA, 'access-a3');
+  assert.equal(JSON.parse(persistent.get('si-app-session-v1')).refreshToken,
+    'refresh-3');
+});
+
+test('cross-tab: sign-out in another tab drops this tab session', async () => {
+  const { make, persistent } = persistentFixture({
+    responder: () => tokenResponse({
+      access_token: 'access-a', refresh_token: 'refresh-2', expires_in: 3600,
+    }),
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-1', savedAt: 1 }));
+  const tabA = make();
+  assert.equal(await tabA.getToken(), 'access-a');
+  const tabB = make();
+  tabB.clearSession();
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  // Tab A must not keep acting on the signed-out session: its
+  // next token request drops the stale in-memory credentials.
+  assert.equal(await tabA.getToken(), null);
+});
+
+
+test('cross-tab: a fragment-only session is superseded by another tab (round 2)', async () => {
+  // Round 1's supersession check required a refresh token, so
+  // a tab holding ONLY a fragment session kept serving the old
+  // account after another tab adopted a different one.
+  const { make, session, persistent, location } = persistentFixture({
+    responder: (url, options) => {
+      const body = new URLSearchParams(options.body);
+      if (body.get('refresh_token') === 'refresh-b1') {
+        return tokenResponse({
+          access_token: 'access-b2', refresh_token: 'refresh-b2',
+          expires_in: 3600,
+        });
+      }
+      return tokenResponse({});
+    },
+  });
+  const tabA = make();
+  const nonce = session.get('si-fragment-handoff-v1');
+  assert.ok(nonce);
+  location.hash = `#access_token=access-frag-a&state=${nonce}`;
+  assert.equal(tabA.takeFragment(), true);
+  assert.equal(await tabA.getToken(), 'access-frag-a');
+  // Another tab signs in with its own account and persists it.
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-b1', savedAt: 1 }));
+  const tabB = make();
+  assert.equal(await tabB.getToken(), 'access-b2');
+  // Tab A's fragment session is superseded: it is never served
+  // again (the call resolves the CURRENT shared session or
+  // nothing — here nothing usable answers, so null).
+  assert.notEqual(await tabA.getToken(), 'access-frag-a');
+  assert.equal(await tabA.getToken(), null);
+});
+
+test('cross-tab: a fenced proactive refresh never falls back to the old token (round 2)', async () => {
+  // The access token has 30s left, inside the refresh margin,
+  // so getToken refreshes proactively. Another tab signs out
+  // while the refresh is in flight; the fence discards the
+  // response, and getToken must return null rather than the
+  // still-valid old access token (Astra's exact counterexample).
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, persistent } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      const presented = body.get('refresh_token');
+      if (presented === 'refresh-a1') {
+        return tokenResponse({
+          access_token: 'access-a1', refresh_token: 'refresh-a1r',
+          expires_in: 30,
+        });
+      }
+      if (presented === 'refresh-a1r') {
+        await gate;
+        return tokenResponse({
+          access_token: 'access-a2', refresh_token: 'refresh-a2',
+          expires_in: 3600,
+        });
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+  const tabA = make();
+  assert.equal(await tabA.getToken(), 'access-a1');
+  const pending = tabA.getToken(); // proactive refresh starts
+  await new Promise((resolve) => setImmediate(resolve));
+  const tabB = make();
+  tabB.clearSession();
+  releaseRefresh();
+  assert.equal(await pending, null);
+  assert.equal(await tabA.getToken(), null);
+});
+
+test('cross-tab: the fence survives a legacy record at the numeric ceiling (round 2)', async () => {
+  // A numeric epoch at 2^53 cannot advance (+1 is a no-op), so
+  // a write from another tab left the compared value unchanged
+  // and an in-flight refresh for the old account was adopted.
+  // String revisions have no ceiling: any foreign write moves
+  // the fence.
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, persistent } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      if (body.get('refresh_token') === 'refresh-a1') {
+        await gate;
+        return tokenResponse({
+          access_token: 'access-a2', refresh_token: 'refresh-a2',
+          expires_in: 3600,
+        });
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+  persistent.set('si-app-session-epoch-v1', JSON.stringify({
+    epoch: 9007199254740992, owner: 'another-tab', kind: 'persist', at: 1,
+  }));
+  const tabA = make();
+  const pending = tabA.getToken();
+  await new Promise((resolve) => setImmediate(resolve));
+  const tabB = make();
+  tabB.clearSession();
+  releaseRefresh();
+  assert.equal(await pending, null);
+  assert.equal(persistent.has('si-app-session-v1'), false);
+  // The record now carries a string revision, not a number.
+  const record = JSON.parse(persistent.get('si-app-session-epoch-v1'));
+  assert.equal(typeof record.rev, 'string');
+  assert.ok(record.rev.length >= 16);
+});
+
+
+test('cross-tab: a failed retry never serves the superseded access token (round 3)', async () => {
+  // Astra's round-2 counterexample: A refreshes proactively;
+  // B signs in; A's response is fenced off as superseded; A
+  // retries with B's persisted token — and the retry FAILS.
+  // The retry switch must retire A's access token with A's
+  // refresh token: credentials and binding are one unit, and
+  // the revision check alone passes once A rebinds to B.
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, persistent } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      const presented = body.get('refresh_token');
+      if (presented === 'refresh-a1') {
+        return tokenResponse({
+          access_token: 'access-a1', refresh_token: 'refresh-a1r',
+          expires_in: 30,
+        });
+      }
+      if (presented === 'refresh-a1r') {
+        await gate;
+        return tokenResponse({
+          access_token: 'access-a2', refresh_token: 'refresh-a2',
+          expires_in: 3600,
+        });
+      }
+      if (presented === 'refresh-b1') {
+        return tokenResponse({
+          access_token: 'access-b', refresh_token: 'refresh-b2',
+          expires_in: 3600,
+        });
+      }
+      if (presented === 'refresh-b2') {
+        throw new Error('transport down');
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+  const tabA = make();
+  assert.equal(await tabA.getToken(), 'access-a1');
+  const pending = tabA.getToken(); // proactive refresh, gated
+  await new Promise((resolve) => setImmediate(resolve));
+  // B signs in over the shared storage.
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-b1', savedAt: 1 }));
+  const tabB = make();
+  assert.equal(await tabB.getToken(), 'access-b');
+  releaseRefresh();
+  // A's response is discarded; the retry against B's token
+  // fails on transport; nothing of A's may be served.
+  assert.equal(await pending, null);
+  assert.equal(await tabA.getToken(), null);
+});
+
+test('cross-tab: a malformed retry response never serves the old token (round 3)', async () => {
+  let releaseRefresh;
+  const gate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const { make, persistent } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      const presented = body.get('refresh_token');
+      if (presented === 'refresh-a1') {
+        return tokenResponse({
+          access_token: 'access-a1', refresh_token: 'refresh-a1r',
+          expires_in: 30,
+        });
+      }
+      if (presented === 'refresh-a1r') {
+        await gate;
+        return tokenResponse({
+          access_token: 'access-a2', refresh_token: 'refresh-a2',
+          expires_in: 3600,
+        });
+      }
+      if (presented === 'refresh-b1') {
+        return tokenResponse({
+          access_token: 'access-b', refresh_token: 'refresh-b2',
+          expires_in: 3600,
+        });
+      }
+      // refresh-b2 answers with a body carrying no access token.
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+  const tabA = make();
+  assert.equal(await tabA.getToken(), 'access-a1');
+  const pending = tabA.getToken();
+  await new Promise((resolve) => setImmediate(resolve));
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-b1', savedAt: 1 }));
+  const tabB = make();
+  assert.equal(await tabB.getToken(), 'access-b');
+  releaseRefresh();
+  assert.equal(await pending, null);
+  assert.equal(await tabA.getToken(), null);
+});
+
+
+test('cross-tab: a successful refresh is fenced again before it is served (round 4)', async () => {
+  // Astra's round-3 race: A's refresh passes both token-request
+  // fences and adopts A's new credentials; B replaces the
+  // shared session in the microtask gap BEFORE A's awaiting
+  // getToken resumes. Returning the captured refresh result
+  // would serve the superseded account — the supersession
+  // check must run after every awaited refresh, success
+  // included, and what is served is the current session's
+  // token or nothing.
+  const { make, persistent } = persistentFixture({
+    responder: async (url, options) => {
+      const body = new URLSearchParams(options.body);
+      if (body.get('refresh_token') === 'refresh-a1') {
+        return {
+          ok: true, status: 200,
+          json: async () => {
+            // Land B's replacement two microtask hops out:
+            // after this response's second fence check and
+            // adoption, before the awaiting caller resumes.
+            Promise.resolve().then().then(() => {
+              persistent.set('si-app-session-v1', JSON.stringify({
+                refreshToken: 'refresh-b', savedAt: 2,
+              }));
+              persistent.set('si-app-session-epoch-v1', JSON.stringify({
+                rev: 'b-revision', owner: 'another-instance',
+                kind: 'persist', at: 2,
+              }));
+            });
+            return {
+              access_token: 'access-a2', refresh_token: 'refresh-a2',
+              expires_in: 3600,
+            };
+          },
+        };
+      }
+      return tokenResponse({});
+    },
+  });
+  persistent.set('si-app-session-v1',
+    JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+  const tabA = make();
+  assert.equal(await tabA.getToken(), null);
+  assert.equal(await tabA.getToken(), null);
+});
+
+
+test('cross-tab: dispatch is fenced — a replacement before dispatch prevents the request (round 5)', async () => {
+  // Astra's round-4 consumer gap: the API client awaited
+  // getToken() and dispatched with the captured string, so a
+  // session replacement landing after getToken returned but
+  // before dispatch was answered with the superseded account's
+  // token. withCurrentToken puts the final fence, the token
+  // selection and the dispatch invocation in one synchronous
+  // block. Both wirings are exercised against the same
+  // interleaving (the other tab's sign-out is queued before
+  // the call, landing between selection and dispatch).
+  async function setup(wiring) {
+    const fixture = persistentFixture({
+      responder: (url, options) => {
+        const body = new URLSearchParams(options.body);
+        if (body.get('refresh_token') === 'refresh-a1') {
+          return tokenResponse({
+            access_token: 'access-a', refresh_token: 'refresh-a2',
+            expires_in: 3600,
+          });
+        }
+        return tokenResponse({});
+      },
+    });
+    fixture.persistent.set('si-app-session-v1',
+      JSON.stringify({ refreshToken: 'refresh-a1', savedAt: 1 }));
+    const tabA = fixture.make();
+    assert.equal(await tabA.getToken(), 'access-a');
+    const apiCalls = [];
+    const apiFetch = async (url, options) => {
+      apiCalls.push([url, options]);
+      return { status: 200, json: async () => ({ ok: true }) };
+    };
+    const client = createAppClient(wiring === 'fenced'
+      ? {
+        fetch: apiFetch, getToken: () => tabA.getToken(),
+        withToken: (d) => tabA.withCurrentToken(d),
+      }
+      : { fetch: apiFetch, getToken: () => tabA.getToken() });
+    return { client, tabB: fixture.make(), apiCalls };
+  }
+  {
+    const { client, tabB, apiCalls } = await setup('fenced');
+    queueMicrotask(() => tabB.clearSession());
+    const result = await client.session();
+    assert.equal(result.kind, 'login');
+    assert.deepEqual(apiCalls, []);
+  }
+  {
+    // The pre-round-5 wiring, kept as the documented gap: the
+    // same interleaving dispatches with the old token.
+    const { client, tabB, apiCalls } = await setup('naive');
+    queueMicrotask(() => tabB.clearSession());
+    const result = await client.session();
+    assert.equal(result.kind, 'ok');
+    assert.equal(apiCalls.length, 1);
+    assert.equal(apiCalls[0][1].headers.authorization, 'Bearer ' + 'access-a');
+  }
 });

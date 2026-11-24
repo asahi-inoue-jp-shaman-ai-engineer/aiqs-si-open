@@ -11,6 +11,26 @@ import uuid
 import time
 from .catalog_store import CatalogStore
 from .dplanet import DPlanetError
+
+
+def _payload_octets_expression():
+    """SQL expression for the payload's byte length. octet_length()
+    (SQLite >= 3.43) reads the length from the record header without
+    loading the value; older libraries fall back to the BLOB cast,
+    whose length is the same byte count (len() on TEXT would count
+    characters and under-report multibyte payloads)."""
+    try:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("SELECT octet_length('x')")
+        finally:
+            probe.close()
+        return "octet_length(payload)"
+    except sqlite3.Error:
+        return "length(CAST(payload AS BLOB))"
+
+
+_PAYLOAD_OCTETS = _payload_octets_expression()
 from .notifications import (CLAIM_STALE_SECONDS, ESCALATION_GRACE_SECONDS,
                             MAX_DELIVERY_ATTEMPTS, NOTIFICATION_TTL_SECONDS,
                             plausible_email)
@@ -19,7 +39,7 @@ from .policies import load_grant_policy, load_limit_policy
 from .referral import ReferralStore
 from .pricing import purchase_quote, rate_display, session_charge_credits
 from .result_schema import (public_bool, public_count, public_mode,
-                            validate_worker_result)
+                            validate_result_semantics, validate_worker_result)
 
 # Historical default grant amounts. The effective values come from
 # the grant policy (policies.load_grant_policy); these constants stay
@@ -209,6 +229,22 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                 CREATE TABLE IF NOT EXISTS job_devices (
                     job TEXT PRIMARY KEY REFERENCES jobs(id),
                     diode_serial_hash TEXT NOT NULL);
+                -- Single-row worker presence record: the last time
+                -- an authorized worker polled /worker/claim. The
+                -- duration estimator treats a stale or missing row
+                -- as "no worker", i.e. no honest basis for a
+                -- completion estimate.
+                CREATE TABLE IF NOT EXISTS worker_contact (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    seen_at REAL NOT NULL);
+                -- The estimator's lane reads filter the jobs table
+                -- by state; without this index they scan the whole
+                -- job history on every poll. (SQLite cannot index
+                -- the rowid pseudo-column; the table itself is in
+                -- rowid order, so filtering by state is the part
+                -- that needs the index.)
+                CREATE INDEX IF NOT EXISTS idx_jobs_state
+                    ON jobs(state);
                 -- Durable D-Planet reservation intents (Astra
                 -- preventive review 2026-11-22, batch 2b item 1): the
                 -- remote operation id exists only in memory between
@@ -590,6 +626,27 @@ class Store(CatalogStore, GrantStore, ReferralStore):
         db.execute("PRAGMA secure_delete=ON")
         try:
             db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @contextmanager
+    def read_transaction(self):
+        """Deferred read snapshot for advisory readers (the duration
+        estimator). query_only is enforced, and no writer (RESERVED)
+        lock is taken; in rollback-journal mode a reader still holds
+        a shared lock while it reads, so callers keep the read short
+        and never parse payloads inside it."""
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN DEFERRED")
             yield db
             db.commit()
         except BaseException:
@@ -1819,6 +1876,171 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                     "position": ahead + 1 if waiting else None,
                     "blocked_by_unresolved_execution": blocked if waiting else row["state"] == "unknown",
                     "estimated_wait_seconds": None}
+
+    @staticmethod
+    def _lane_entry(state, payload_text):
+        """One lane occupant as the duration estimator may see it:
+        state plus the payload's operation and shot count, decoded
+        OUTSIDE any transaction (payloads are never parsed under a
+        database lock). A payload that no longer decodes — including
+        JSON nested past the interpreter's recursion limit — yields
+        operation None: the job still occupies the lane, and the
+        estimator treats the missing facts as a missing basis
+        instead of guessing."""
+        operation, count = None, None
+        try:
+            payload = json.loads(payload_text)
+        except (ValueError, TypeError, RecursionError):
+            payload = None
+        if isinstance(payload, dict):
+            candidate = payload.get("operation")
+            if candidate in ("scan", "irradiation"):
+                operation = candidate
+                raw_count = payload.get("irradiation_count")
+                if type(raw_count) is int:
+                    count = raw_count
+        return {"state": state, "operation": operation,
+                "irradiation_count": count}
+
+    # Work budget for one duration estimate: the lane is a single
+    # physical device, so a longer queue or larger payloads than
+    # this are outside anything the estimator will price — it
+    # answers "no basis" rather than truncating the sum or paying
+    # unbounded parse work per poll.
+    ESTIMATE_MAX_LANE_ENTRIES = 100
+    ESTIMATE_MAX_PAYLOAD_BYTES = 64 * 1024
+    ESTIMATE_MAX_TOTAL_PAYLOAD_BYTES = 1024 * 1024
+
+    def lane_estimate_basis(self, owner=None, job_id=None):
+        """One coherent read for the duration estimator: the global
+        unresolved-execution flag, the target job's current state
+        (when a job is named), and the lane occupants ahead of it —
+        or the whole lane when no job is named. Only the estimator's
+        aggregate inputs leave the store, never another owner's job
+        details. Raw rows are fetched in one short deferred read so
+        advisory polling never takes the writer lock; payloads are
+        decoded after the transaction closes. When the answer is
+        already determined (lane blocked, or the named job is not
+        queued) the lane read is skipped entirely. Work is bounded
+        by the ESTIMATE_* budget, enforced before any payload text
+        is materialized (rowid cap, then stored byte lengths, then
+        text): exceeding it reports over_budget and the estimator
+        answers None — never a truncated sum.
+        Naming a job is owner-validated with the same KeyError
+        contract as queue_status: another owner's job raises
+        KeyError."""
+        with self.read_transaction() as db:
+            blocked = bool(db.execute(
+                "SELECT 1 FROM jobs WHERE state='unknown' LIMIT 1"
+            ).fetchone())
+            target_state = None
+            boundary = None
+            if job_id is not None:
+                row = db.execute(
+                    "SELECT rowid AS sequence, state FROM jobs "
+                    "WHERE id=? AND owner=?", (job_id, owner)).fetchone()
+                if row is None:
+                    raise KeyError("Job not found")
+                target_state = row["state"]
+                boundary = row["sequence"]
+            if blocked or (job_id is not None
+                           and target_state != "queued"):
+                return {"blocked": blocked, "target_state": target_state,
+                        "entries": [], "over_budget": False}
+            # The work budget is enforced BEFORE any payload text
+            # is materialized, in three phases inside the same
+            # snapshot: candidate rowids capped at the entry limit
+            # + 1, then stored BYTE lengths (never the character
+            # count — len() on TEXT would under-report), and
+            # only then the payload text of the approved rows.
+            # INDEXED BY pins the state index in both branches:
+            # with the boundary predicate the planner otherwise
+            # prefers a rowid search and scans the whole terminal
+            # history below the boundary (Astra round 4). There is
+            # deliberately no ORDER BY: an over-limit result is
+            # rejected outright, and an accepted result contains
+            # every qualifying row — phase 2 restores rowid order.
+            if boundary is None:
+                candidates = db.execute(
+                    "SELECT rowid FROM jobs INDEXED BY idx_jobs_state "
+                    "WHERE state IN ('queued','running','unknown') "
+                    "LIMIT ?",
+                    (self.ESTIMATE_MAX_LANE_ENTRIES + 1,)).fetchall()
+            else:
+                candidates = db.execute(
+                    "SELECT rowid FROM jobs INDEXED BY idx_jobs_state "
+                    "WHERE state IN ('queued','running','unknown') "
+                    "AND rowid < ? LIMIT ?",
+                    (boundary,
+                     self.ESTIMATE_MAX_LANE_ENTRIES + 1)).fetchall()
+            over_budget = (len(candidates)
+                           > self.ESTIMATE_MAX_LANE_ENTRIES)
+            raw = []
+            if not over_budget and candidates:
+                ids = [row["rowid"] for row in candidates]
+                marks = ",".join("?" for _ in ids)
+                sized = db.execute(
+                    "SELECT rowid, state, "
+                    f"{_PAYLOAD_OCTETS} AS nbytes FROM jobs "
+                    f"WHERE rowid IN ({marks}) ORDER BY rowid",
+                    ids).fetchall()
+                over_budget = (
+                    any(row["nbytes"] > self.ESTIMATE_MAX_PAYLOAD_BYTES
+                        for row in sized)
+                    or sum(row["nbytes"] for row in sized)
+                    > self.ESTIMATE_MAX_TOTAL_PAYLOAD_BYTES)
+                if not over_budget:
+                    texts = db.execute(
+                        "SELECT rowid, payload FROM jobs "
+                        f"WHERE rowid IN ({marks}) ORDER BY rowid",
+                        ids).fetchall()
+                    by_id = {row["rowid"]: row["payload"]
+                             for row in texts}
+                    raw = [(row["state"], by_id[row["rowid"]])
+                           for row in sized]
+        return {"blocked": blocked, "target_state": target_state,
+                "entries": [] if over_budget else
+                [self._lane_entry(state, payload)
+                 for state, payload in raw],
+                "over_budget": over_budget}
+
+    def note_worker_contact(self, now=None):
+        """Record that an authorized worker completed a claim or
+        heartbeat operation. The worker loop polls every couple of
+        seconds, so writes are throttled to one per 30 s — presence
+        granularity stays far below the estimator's freshness
+        window. The throttle check first runs in a deferred read,
+        so the common already-fresh case never opens a writer
+        transaction on the claim hot path. A stored timestamp in
+        the future (the wall clock moved backwards) never engages
+        the throttle: a genuine contact always replaces it."""
+        now = time.time() if now is None else now
+
+        def fresh(db):
+            row = db.execute(
+                "SELECT seen_at FROM worker_contact WHERE id=1").fetchone()
+            return row is not None and 0 <= now - row["seen_at"] < 30
+
+        with self.read_transaction() as db:
+            if fresh(db):
+                return
+        with self.transaction() as db:
+            if fresh(db):
+                return
+            db.execute(
+                "INSERT INTO worker_contact(id, seen_at) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET seen_at=excluded.seen_at",
+                (now,))
+
+    def worker_last_seen(self):
+        """When an authorized worker last polled the claim queue,
+        or None if none ever has. The duration estimator treats a
+        missing or stale value as "no worker": no honest basis for
+        a completion estimate."""
+        with self.read_transaction() as db:
+            row = db.execute(
+                "SELECT seen_at FROM worker_contact WHERE id=1").fetchone()
+            return None if row is None else row["seen_at"]
 
     @staticmethod
     def _diode_hash_valid(value):
@@ -3992,7 +4214,14 @@ class Store(CatalogStore, GrantStore, ReferralStore):
             # None for that field, never the raw value.
             completed = progress["completed"] if progress else (
                 public_count(result.get("completed_count")) if result else None)
-            requested = public_count(result.get("requested_count")) if result else None
+            # The reservation in the payload is authoritative for
+            # the requested count (batch 2d, MEDIUM 5): the proof
+            # previously preferred the worker's own figure, so a
+            # result could publish one count while the proof
+            # certified another.
+            _payload_count = payload.get("irradiation_count")
+            requested = _payload_count if type(_payload_count) is int else (
+                public_count(result.get("requested_count")) if result else None)
             evidence = {
                 "job_id": row["id"],
                 "operation": payload.get("operation"),
@@ -4166,6 +4395,22 @@ class Store(CatalogStore, GrantStore, ReferralStore):
                         or type(result.get("completed_count")) is not int
                         or result["completed_count"] != progress["completed"]):
                     raise ValueError("Confirmed stop and matching progress required")
+            # Semantic binding (batch 2d, MEDIUM 5): well-typed is
+            # not the same as true. The counts and claims in the
+            # result must agree with the authoritative records —
+            # the reservation in the payload, the server-tracked
+            # progress, the pinned catalog — and a physical-output
+            # verification claim is rejected outright, because the
+            # server has no mechanism that could make it true.
+            _payload = json.loads(row["payload"])
+            _reserved = _payload.get("irradiation_count")
+            if _payload.get("operation") != "irradiation" or type(_reserved) is not int \
+                    or isinstance(_reserved, bool) or _reserved < 1:
+                _reserved = None
+            validate_result_semantics(
+                result, operation=_payload.get("operation"), state=state,
+                reserved_count=_reserved,
+                progress_completed=progress["completed"] if progress else None)
             player_id = self._route_player(db, job)
             db.execute("UPDATE jobs SET state=?,result=? WHERE id=?", (state, encoded, job))
             if json.loads(row["payload"]).get("operation") == "scan":

@@ -79,14 +79,20 @@ def _public_entries(store, payload, raw_entries):
     return public
 
 
-def _public_result(store, payload, result):
+def _public_result(store, job, payload, result):
     view = {}
     mode = public_mode(result.get("mode"))
     if mode is not None:
         view["mode"] = mode
     verified = public_bool(result.get("physical_output_verified"))
     if verified is not None:
-        view["physical_output_verified"] = verified
+        # The server never verifies physical output (batch 2d,
+        # MEDIUM 5): a stored True — legacy row or worker claim —
+        # is not a claim the server can stand behind, and the
+        # execution proof has always published False for exactly
+        # this field. Publishing the raw True here made result
+        # and proof contradict each other.
+        view["physical_output_verified"] = False
     reason = public_reason(result.get("reason"))
     if reason is not None:
         view["reason"] = reason
@@ -101,8 +107,22 @@ def _public_result(store, payload, result):
                 public_bool(scan.get("observer_coordinate_applied")) is True,
         }
     elif operation == "irradiation":
+        # Counts are derived from the authoritative records where
+        # they exist (batch 2d, MEDIUM 5): the requested count is
+        # the reservation in the payload, the completed count is
+        # the server-tracked execution progress. The worker's own
+        # figures remain only as a fallback for rows that predate
+        # those records, sanitized by the schema as before.
+        execution = job.get("execution")
+        execution = execution if isinstance(execution, dict) else {}
+        authoritative = {
+            "requested_count": public_count(payload.get("irradiation_count")),
+            "completed_count": public_count(execution.get("completed_count")),
+        }
         for key in ("requested_count", "completed_count", "simulated_count"):
-            count = public_count(result.get(key))
+            count = authoritative.get(key)
+            if count is None:
+                count = public_count(result.get(key))
             if count is not None:
                 view[key] = count
         for key in ("stop_command_acknowledged", "executed_physically"):
@@ -130,5 +150,5 @@ def public_job_view(store, job):
         }
     result = job.get("result")
     if isinstance(result, dict):
-        view["result"] = _public_result(store, payload, result)
+        view["result"] = _public_result(store, job, payload, result)
     return view

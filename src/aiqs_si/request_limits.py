@@ -37,12 +37,75 @@ health, account operations and cancellation alike. Now:
   bucket. Forwarded IPs are never trusted; the per-source key is
   the direct peer only, so behind a tunnel it degrades to a second
   process-wide bucket and the lane caps remain the real bound.
+- Reading generation has its own execution pool (batch 2d,
+  HIGH 2): admission is a two-phase swap. The caller's LANE slot
+  covers admission and body buffering — an unauthenticated
+  reading POST consumes public slots under the public body
+  deadline, an authenticated one authenticated slots — so held
+  uploads always occupy bounded lane capacity. Once the body is
+  fully buffered, the lane slot is released and the reading
+  pool slot is acquired for the execution alone: a slot pays
+  for provider wait, never for upload, and a generation never
+  holds a lane slot hostage either.
+- Worker-token rotation has a reserved verification channel
+  (batch 2d, HIGH 3): the shared verification budget is spent by
+  whoever sends forged tokens, so a brand-new legitimate token
+  (rotation is a cache miss by definition) could starve behind a
+  flood. When the operator configures a worker boundary key, a
+  worker request presenting it verifies through a SEPARATE small
+  budget and pool that unknown traffic cannot draw from — the
+  application-layer form of an authenticated private ingress.
+  The channel covers stale-entry revalidation as well as cache
+  misses, so boundary workers never depend on the shared
+  revalidation reserve that account traffic can inflate. The
+  credential is compared in constant time, is never logged,
+  and the reserved channel is itself budgeted, so holding the
+  key buys bounded verification work, not an oracle. Without a
+  configured key the historical shared-budget behavior is
+  unchanged.
 """
 import asyncio
 import hashlib
+import hmac
+import os
 from time import monotonic, time
 from starlette.responses import JSONResponse
 from .jwks import VerificationUnavailable
+
+WORKER_BOUNDARY_KEY_ENV = "AIQS_SI_WORKER_BOUNDARY_KEY"
+
+
+def worker_boundary_key_from_env(environ=None):
+    """The operator-configured worker boundary credential, or
+    None when the deployment does not use the reserved
+    verification channel. The value is a credential: it is read
+    from the environment only, never logged or returned."""
+    environ = os.environ if environ is None else environ
+    value = environ.get(WORKER_BOUNDARY_KEY_ENV)
+    if not isinstance(value, str) or not value:
+        return None
+    return value
+
+
+class _SlotLease:
+    """One held admission counter with an idempotent release.
+
+    The reading lane swap hands the lane slot back mid-request
+    (after buffering, before execution); the lane branch's own
+    finally also releases, so the release must be safe to call
+    twice — exactly one decrement ever happens."""
+
+    def __init__(self, guard, attribute):
+        self._guard = guard
+        self._attribute = attribute
+        self._held = True
+
+    def release(self):
+        if self._held:
+            self._held = False
+            setattr(self._guard, self._attribute,
+                    getattr(self._guard, self._attribute) - 1)
+
 
 _HEALTH_PATHS = frozenset({"/health"})
 _SOURCE_BUCKET_LIMIT = 4096
@@ -66,7 +129,9 @@ class RequestBodyLimit:
                  auth_max_concurrent=12, public_body_timeout=20,
                  source_rate=None, source_burst=None, worker_only=False,
                  worker_verify_rate=40, worker_verify_burst=80,
-                 reading_max_concurrent=4):
+                 reading_max_concurrent=4,
+                 worker_boundary_key=None,
+                 worker_boundary_verify_rate=5, worker_boundary_verify_burst=10):
         self.app = app
         self.max_concurrent = max_concurrent
         self.body_timeout = body_timeout
@@ -95,6 +160,19 @@ class RequestBodyLimit:
         self.worker_verify_burst = worker_verify_burst
         self.worker_verify_tokens = float(worker_verify_burst)
         self.worker_verify_updated = monotonic()
+        # Reserved worker verification channel (batch 2d, HIGH 3):
+        # a separate budget and pool reachable only with the
+        # operator-configured boundary credential, so a forged-
+        # token flood against the shared budget above cannot
+        # starve a rotating worker's first verification.
+        if isinstance(worker_boundary_key, str):
+            worker_boundary_key = worker_boundary_key.encode("utf-8")
+        self.worker_boundary_key = worker_boundary_key or None
+        self.boundary_verify_rate = worker_boundary_verify_rate
+        self.boundary_verify_burst = worker_boundary_verify_burst
+        self.boundary_verify_tokens = float(worker_boundary_verify_burst)
+        self.boundary_verify_updated = monotonic()
+        self.boundary_verify_active = 0
         self.auth_max_concurrent = auth_max_concurrent
         self.authed_active = 0
         self.auth_tokens, self.auth_updated = float(burst), monotonic()
@@ -196,28 +274,69 @@ class RequestBodyLimit:
         else:
             entry[2] = monotonic() + _REVERIFY_COOLDOWN
 
-    def _revalidation_begin(self, domain, key):
+    def _revalidation_begin(self, domain, key, *, channel="shared"):
         """Reserve one reserved-lane revalidation for this entry:
-        the shared revalidation bucket and pool, plus a per-entry
-        in-flight marker so concurrent requests for the SAME
-        lapsed token coalesce onto a single attempt (the others
-        fall back immediately)."""
+        the revalidation bucket and pool of the given channel,
+        plus a per-entry in-flight marker so concurrent requests
+        for the SAME lapsed token coalesce onto a single attempt
+        (the others fall back immediately).
+
+        Channels (batch 2d, HIGH 3 round 2): "shared" is the
+        original account/worker revalidation reserve. "boundary"
+        draws from the worker boundary channel's own budget and
+        pool, so a boundary-authorized worker's STALE entry —
+        not just its cache misses — never competes with account
+        revalidation traffic an attacker can inflate. The
+        coalescing marker is shared across channels: one
+        revalidation per entry at a time, whoever pays for it."""
         marker = (domain, key)
         if marker in self._revalidating:
             return False
         now = monotonic()
-        self.reverify_tokens = min(
-            self.reverify_burst,
-            self.reverify_tokens + (now - self.reverify_updated) * self.reverify_rate)
-        self.reverify_updated = now
-        if self.reverify_tokens < 1 or self.reverify_active >= 2:
-            return False
-        self.reverify_tokens -= 1
+        if channel == "boundary":
+            self.boundary_verify_tokens = min(
+                self.boundary_verify_burst,
+                self.boundary_verify_tokens
+                + (now - self.boundary_verify_updated) * self.boundary_verify_rate)
+            self.boundary_verify_updated = now
+            if self.boundary_verify_tokens < 1 or self.boundary_verify_active >= 2:
+                return False
+            self.boundary_verify_tokens -= 1
+        else:
+            self.reverify_tokens = min(
+                self.reverify_burst,
+                self.reverify_tokens + (now - self.reverify_updated) * self.reverify_rate)
+            self.reverify_updated = now
+            if self.reverify_tokens < 1 or self.reverify_active >= 2:
+                return False
+            self.reverify_tokens -= 1
         self._revalidating.add(marker)
         return True
 
     def _revalidation_end(self, domain, key):
         self._revalidating.discard((domain, key))
+
+    def _boundary_authorized(self, scope):
+        """True only when a worker boundary credential is
+        configured AND the request presents it exactly. The
+        comparison is constant-time; the credential itself is
+        never logged, cached, or echoed. A wrong or absent
+        credential is not an error — the request simply gets the
+        ordinary shared-budget path."""
+        if self.worker_boundary_key is None:
+            return False
+        headers = dict(scope.get("headers", []))
+        presented = headers.get(b"x-si-worker-boundary")
+        if not presented:
+            return False
+        return hmac.compare_digest(presented, self.worker_boundary_key)
+
+    async def _verify_worker_token(self, raw):
+        try:
+            return await asyncio.wait_for(
+                self.worker_verifier.verify_token(raw), 6)
+        except Exception:
+            return None
 
     @staticmethod
     async def _verify_strict(verifier, token):
@@ -307,20 +426,22 @@ class RequestBodyLimit:
         return (scope.get("method") == "POST"
                 and scope["path"].rstrip("/") == "/api/app/readings")
 
-    async def _serve_reading(self, scope, receive, send, *, body_timeout=None):
-        # It draws from the reading pool only, whichever lane
-        # classified the request, so slow readings can never occupy
-        # the general or authenticated pools (batch 2b item 5, kept
-        # under the batch 2c lane split).
-        if self.reading_active >= self.reading_max_concurrent:
-            return await JSONResponse({"error": "server_busy"}, status_code=503,
-                                      headers={"Retry-After": "1"})(scope, receive, send)
-        self.reading_active += 1
-        try:
-            await self._request(scope, receive, send,
-                                body_timeout=body_timeout)
-        finally:
-            self.reading_active -= 1
+    async def _serve_reading(self, scope, receive, send, *, body_timeout=None,
+                             lease=None):
+        # Admission shape (batch 2d, HIGH 2, round-2 form): the
+        # caller's LANE slot — acquired by the lane branch before
+        # this runs — covers admission and body buffering, so a
+        # held upload always occupies bounded lane capacity. The
+        # reading pool pays for EXECUTION only: inside _request,
+        # once the body is fully buffered, the lane lease is
+        # released and the reading slot is taken for the
+        # application's run. Neither pool can be held hostage by
+        # the other's phase: uploads cannot occupy generation
+        # slots (the original HIGH), and generations cannot occupy
+        # lane slots (batch 2b item 5's concern, preserved).
+        await self._request(scope, receive, send,
+                            body_timeout=body_timeout, reading=True,
+                            lease=lease)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -367,19 +488,61 @@ class RequestBodyLimit:
             if state == "stale":
                 # Established worker, lapsed entry: revalidate on
                 # the reserved budget/pool, never against the flood.
-                if not self._revalidation_begin("worker", key):
+                # A boundary-authorized worker revalidates through
+                # its own channel (batch 2d, HIGH 3 round 2): the
+                # shared reserve also serves account revalidation,
+                # which accepted-token traffic can inflate.
+                boundary = self._boundary_authorized(scope)
+                channel = "boundary" if boundary else "shared"
+                if not self._revalidation_begin("worker", key, channel=channel):
                     return await JSONResponse({'error': 'auth_busy'}, status_code=503)(scope, receive, send)
-                self.reverify_active += 1
+                if boundary:
+                    self.boundary_verify_active += 1
+                else:
+                    self.reverify_active += 1
                 try:
                     token, transient = await self._verify_strict(
                         self.worker_verifier, raw)
                 finally:
-                    self.reverify_active -= 1
+                    if boundary:
+                        self.boundary_verify_active -= 1
+                    else:
+                        self.reverify_active -= 1
                     self._revalidation_end("worker", key)
                 if token is None or token.subject not in self.allowed_workers:
                     self._revalidation_failed(
                         "worker", key, entry,
                         definitive=not transient)
+                    return await JSONResponse({'error': 'unauthorized'}, status_code=401)(scope, receive, send)
+                self._cache_store("worker", key, token)
+                return await self.worker_lane(scope, receive, send)
+            if self._boundary_authorized(scope):
+                # Reserved verification channel (batch 2d, HIGH 3):
+                # the request carries the operator-configured
+                # boundary credential, so its first verification —
+                # above all a ROTATED token, which is a cache miss
+                # by definition — draws from a budget and pool that
+                # unknown traffic cannot touch. The channel is
+                # itself bounded: the credential buys a small
+                # reserved budget, not unbounded signature work.
+                now = monotonic()
+                self.boundary_verify_tokens = min(
+                    self.boundary_verify_burst,
+                    self.boundary_verify_tokens
+                    + (now - self.boundary_verify_updated) * self.boundary_verify_rate)
+                self.boundary_verify_updated = now
+                if self.boundary_verify_tokens < 1:
+                    return await JSONResponse({'error': 'rate_limited'}, status_code=429,
+                                              headers={'Retry-After': '1'})(scope, receive, send)
+                if self.boundary_verify_active >= 2:
+                    return await JSONResponse({'error': 'auth_busy'}, status_code=503)(scope, receive, send)
+                self.boundary_verify_tokens -= 1
+                self.boundary_verify_active += 1
+                try:
+                    token = await self._verify_worker_token(raw)
+                finally:
+                    self.boundary_verify_active -= 1
+                if token is None or token.subject not in self.allowed_workers:
                     return await JSONResponse({'error': 'unauthorized'}, status_code=401)(scope, receive, send)
                 self._cache_store("worker", key, token)
                 return await self.worker_lane(scope, receive, send)
@@ -402,9 +565,7 @@ class RequestBodyLimit:
             self.worker_verify_tokens -= 1
             self.auth_active += 1
             try:
-                token = await asyncio.wait_for(self.worker_verifier.verify_token(raw), 6)
-            except Exception:
-                token = None
+                token = await self._verify_worker_token(raw)
             finally:
                 self.auth_active -= 1
             if token is None or token.subject not in self.allowed_workers:
@@ -430,8 +591,18 @@ class RequestBodyLimit:
                                           headers={"Retry-After": "1"})(scope, receive, send)
             self.auth_tokens -= 1
             if self._is_reading_create(scope):
-                return await self._serve_reading(
-                    scope, receive, send, body_timeout=self.body_timeout)
+                if self.authed_active >= self.auth_max_concurrent:
+                    return await JSONResponse({"error": "server_busy"}, status_code=503,
+                                              headers={"Retry-After": "1"})(scope, receive, send)
+                self.authed_active += 1
+                lease = _SlotLease(self, "authed_active")
+                try:
+                    await self._serve_reading(
+                        scope, receive, send, body_timeout=self.body_timeout,
+                        lease=lease)
+                finally:
+                    lease.release()
+                return
             if self.authed_active >= self.auth_max_concurrent:
                 return await JSONResponse({"error": "server_busy"}, status_code=503,
                                           headers={"Retry-After": "1"})(scope, receive, send)
@@ -455,7 +626,18 @@ class RequestBodyLimit:
             return await JSONResponse({"error": "rate_limited"}, status_code=429,
                                       headers={"Retry-After": "1"})(scope, receive, send)
         if self._is_reading_create(scope):
-            return await self._serve_reading(scope, receive, send)
+            if self.active >= self.max_concurrent:
+                return await JSONResponse({"error": "server_busy"}, status_code=503,
+                                          headers={"Retry-After": "1"})(scope, receive, send)
+            self.active += 1
+            lease = _SlotLease(self, "active")
+            try:
+                await self._serve_reading(
+                    scope, receive, send,
+                    body_timeout=self.public_body_timeout, lease=lease)
+            finally:
+                lease.release()
+            return
         if self.active >= self.max_concurrent:
             return await JSONResponse({"error": "server_busy"}, status_code=503,
                                       headers={"Retry-After": "1"})(scope, receive, send)
@@ -466,7 +648,8 @@ class RequestBodyLimit:
         finally:
             self.active -= 1
 
-    async def _request(self, scope, receive, send, *, body_timeout=None):
+    async def _request(self, scope, receive, send, *, body_timeout=None,
+                       reading=False, lease=None):
         # /mcp carries multi-image scans; app target registration
         # carries two
         # target photos — sized for the modern standard, not the
@@ -513,4 +696,22 @@ class RequestBodyLimit:
                 return {"type": "http.request", "body": bytes(body), "more_body": False}
             return await receive()
 
+        if reading:
+            # The swap: the body is fully buffered under the lane
+            # lease; hand the lane slot back and take the reading
+            # pool slot for the execution alone. If the pool is
+            # full the request is refused AFTER buffering — the
+            # lane slot is already released, so the refusal itself
+            # holds nothing.
+            if lease is not None:
+                lease.release()
+            if self.reading_active >= self.reading_max_concurrent:
+                return await JSONResponse({"error": "server_busy"}, status_code=503,
+                                          headers={"Retry-After": "1"})(scope, receive, send)
+            self.reading_active += 1
+            try:
+                await self.app(scope, bounded_receive, send)
+            finally:
+                self.reading_active -= 1
+            return
         await self.app(scope, bounded_receive, send)

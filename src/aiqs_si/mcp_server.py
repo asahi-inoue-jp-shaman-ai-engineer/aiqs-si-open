@@ -10,6 +10,8 @@ from pydantic import StrictInt
 from contextlib import asynccontextmanager
 import asyncio
 import os
+from .deployment import store_in_production
+from .policies import enforce_policy_posture
 from .service import Service
 from .maintenance import Maintenance
 from .worker import Worker
@@ -42,6 +44,14 @@ def registration_enabled_from_env(environ=None):
 def create_account_server(store, owner, *, embedded_test_worker=True, service=None, billing=None,
                           dplanet_client=_DPLANET_FROM_ENV, registration_ready=None, **server_options):
     """Local trusted-launcher identity only; not an HTTP authentication mechanism."""
+    if store_in_production(store):
+        # Policy posture at this composition boundary too
+        # (Antigravity glass audit, finding 7): the account/
+        # stdio MCP server had no gate, so a production-marked
+        # process could start it on the built-in default
+        # policies. First in the body: the default Service
+        # construction below must never run ahead of the gate.
+        enforce_policy_posture()
     if not callable(owner):
         store.balance(owner)
     def current_owner():

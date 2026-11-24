@@ -126,7 +126,8 @@ class AppNotifyApiTests(unittest.TestCase):
             response = self.submit_scan(client, completion={"mode": "notify"})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["completion"],
-                             {"mode": "notify", "notification": "armed"})
+                             {"mode": "notify", "notification": "armed",
+                              "deliverable": True})
             row = self.store.job_notification(response.json()["job_id"])
             self.assertEqual(row["email"], EMAIL_A)
             self.assertEqual(row["operation"], "scan")
@@ -140,6 +141,58 @@ class AppNotifyApiTests(unittest.TestCase):
             # Wait mode still captures the address so an unviewed
             # result can escalate to mail instead of being dropped.
             self.assertEqual(row["email"], EMAIL_A)
+
+    def test_completion_deliverable_follows_the_record(self):
+        # Combined review finding 2: the client may promise a
+        # completion mail only when THIS job's record can
+        # actually be mailed. A wait-mode submission from a
+        # token without an email claim records an armed row
+        # with no address — the escalation requires one, so the
+        # view must report deliverable=False even though the
+        # lifecycle state is a promise state.
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, email=None)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["completion"],
+                             {"mode": "wait", "notification": "armed",
+                              "deliverable": False})
+            row = self.store.job_notification(response.json()["job_id"])
+            self.assertIsNone(row["email"])
+        # Delivery unconfigured: an addressed record is still
+        # not deliverable.
+        with self.open() as client:
+            response = self.submit_scan(client, key="scan-unconf")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["completion"]["notification"],
+                             "armed")
+            self.assertFalse(response.json()["completion"]["deliverable"])
+
+    def test_completion_deliverable_dies_when_a_sending_record_is_viewed(self):
+        # Combined review round 2, F2: a record claimed by the
+        # dispatcher ('sending') keeps its status and address
+        # when the result is viewed — the mail may already be
+        # on the wire — but the delivery gate suppresses viewed
+        # records, so the view must stop calling it deliverable.
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, completion={"mode": "notify"})
+            job_id = response.json()["job_id"]
+            Worker(self.store, SyntheticDevice()).run_one()
+            # Freeze the record mid-delivery, in the state the
+            # dispatcher leaves between claim and send.
+            with self.store.transaction() as db:
+                db.execute("UPDATE job_notifications SET status='sending' "
+                           "WHERE job=?", (job_id,))
+            view = client.get(f"/api/app/jobs/{job_id}",
+                              headers=self.auth(email=EMAIL_A))
+            self.assertEqual(view.json()["completion"],
+                             {"mode": "notify", "notification": "sending",
+                              "deliverable": True})
+            ack = client.post(f"/api/app/jobs/{job_id}/viewed",
+                              headers=self.auth(email=EMAIL_A), json={})
+            self.assertEqual(ack.status_code, 200, ack.text)
+            self.assertEqual(ack.json()["completion"],
+                             {"mode": "notify", "notification": "sending",
+                              "deliverable": False})
 
     def test_notify_refused_before_submission_when_unconfigured(self):
         with self.open() as client:  # delivery not configured
@@ -187,6 +240,11 @@ class AppNotifyApiTests(unittest.TestCase):
     # --- viewed suppression through the job view ---
 
     def test_viewing_the_finished_job_suppresses_the_mail(self):
+        # Batch 2d, MEDIUM 6: the status GET alone no longer
+        # records a view — the wait screens poll it, and a poll
+        # landing just after completion used to suppress the
+        # completion mail for a user who never saw the result.
+        # The explicit ack is what suppresses the mail now.
         with self.open(notification_mailer=self.mailer) as client:
             response = self.submit_scan(client, completion={"mode": "notify"})
             job_id = response.json()["job_id"]
@@ -198,9 +256,111 @@ class AppNotifyApiTests(unittest.TestCase):
             self.assertEqual(view.status_code, 200, view.text)
             self.assertEqual(view.json()["state"], "completed")
             self.assertEqual(view.json()["completion"],
-                             {"mode": "notify", "notification": "suppressed"})
+                             {"mode": "notify", "notification": "queued",
+                              "deliverable": True})
+            ack = client.post(f"/api/app/jobs/{job_id}/viewed",
+                              headers=self.auth(email=EMAIL_A), json={})
+            self.assertEqual(ack.status_code, 200, ack.text)
+            self.assertEqual(ack.json()["viewed"], True)
+            self.assertEqual(ack.json()["completion"],
+                             {"mode": "notify", "notification": "suppressed",
+                              "deliverable": False})
             self.store.run_notification_cycle()
             self.assertEqual(self.mailer.sent, [])
+
+    def test_polling_without_ack_keeps_the_completion_mail(self):
+        # The MEDIUM 6 failure shape end to end: the wait screen
+        # polls the finished job (GET), the user never renders
+        # the result (no ack), and the mail still goes out.
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, completion={"mode": "notify"})
+            job_id = response.json()["job_id"]
+            Worker(self.store, SyntheticDevice()).run_one()
+            for _ in range(3):
+                view = client.get(f"/api/app/jobs/{job_id}",
+                                  headers=self.auth(email=EMAIL_A))
+                self.assertEqual(view.status_code, 200, view.text)
+            self.store.run_notification_cycle()
+            self.assertEqual(len(self.mailer.sent), 1)
+
+    def test_ack_for_an_in_flight_job_records_nothing(self):
+        # The ack endpoint refuses to record a view for a job
+        # that has not finished: the marker would cancel the
+        # completion mail the user is still owed.
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, completion={"mode": "notify"})
+            job_id = response.json()["job_id"]
+            ack = client.post(f"/api/app/jobs/{job_id}/viewed",
+                              headers=self.auth(email=EMAIL_A), json={})
+            self.assertEqual(ack.status_code, 200, ack.text)
+            self.assertEqual(ack.json()["viewed"], False)
+            Worker(self.store, SyntheticDevice()).run_one()
+            self.store.run_notification_cycle()
+            self.assertEqual(len(self.mailer.sent), 1)
+
+    def test_ack_for_an_unknown_job_records_nothing(self):
+        # Round 2 (Astra): 'unknown' is not an acknowledgeable
+        # outcome. The owner who opens an unknown job has seen
+        # uncertainty, not a result; recording that view
+        # suppressed the notification of the later RESOLVED
+        # outcome permanently. The ack is refused, and when the
+        # job is resolved the mail still goes out.
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, completion={"mode": "notify"})
+            job_id = response.json()["job_id"]
+            claimed = self.store.claim_next(worker="synthetic-worker")
+            self.assertEqual(claimed["id"], job_id)
+            self.store.finish(job_id, "unknown",
+                              {"reason": "execution_outcome_unknown"},
+                              worker="synthetic-worker")
+            ack = client.post(f"/api/app/jobs/{job_id}/viewed",
+                              headers=self.auth(email=EMAIL_A), json={})
+            self.assertEqual(ack.status_code, 200, ack.text)
+            self.assertEqual(ack.json()["viewed"], False)
+            self.assertNotEqual(
+                self.store.job_notification(job_id)["status"], "suppressed")
+            self.store.resolve_unknown(
+                job_id, completed_count=0,
+                stop_evidence_digest="0" * 64)
+            self.store.run_notification_cycle()
+            self.assertEqual(len(self.mailer.sent), 1)
+
+    def test_ack_requires_ownership(self):
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, completion={"mode": "notify"})
+            job_id = response.json()["job_id"]
+            Worker(self.store, SyntheticDevice()).run_one()
+            ack = client.post(
+                f"/api/app/jobs/{job_id}/viewed",
+                headers=self.auth("user-b",
+                                  email="user-b@fixture.example.test"),
+                json={})
+            self.assertEqual(ack.status_code, 404, ack.text)
+            self.store.run_notification_cycle()
+            self.assertEqual(len(self.mailer.sent), 1)
+
+    def test_job_view_reports_removed_scan_content(self):
+        # Batch 2d, MEDIUM 8: after the 24-hour scan expiry, the
+        # job view must say the content is gone — the client
+        # lands the user on the expired screen instead of an
+        # empty ranking presented as a success.
+        import time as _time
+        with self.open(notification_mailer=self.mailer) as client:
+            response = self.submit_scan(client, completion={"mode": "wait"})
+            job_id = response.json()["job_id"]
+            Worker(self.store, SyntheticDevice()).run_one()
+            view = client.get(f"/api/app/jobs/{job_id}",
+                              headers=self.auth(email=EMAIL_A))
+            self.assertEqual(view.json()["content_removed"], False)
+            self.assertIsNotNone(view.json()["result"])
+            removed = self.store.expire_scans(now=_time.time() + 90000)
+            self.assertEqual(removed, 1)
+            view = client.get(f"/api/app/jobs/{job_id}",
+                              headers=self.auth(email=EMAIL_A))
+            self.assertEqual(view.status_code, 200, view.text)
+            self.assertEqual(view.json()["state"], "completed")
+            self.assertEqual(view.json()["content_removed"], True)
+            self.assertIsNone(view.json()["result"])
 
     # --- resume redemption ---
 
@@ -274,7 +434,8 @@ class AppNotifyApiTests(unittest.TestCase):
                       "completion": {"mode": "notify"}})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["completion"],
-                             {"mode": "notify", "notification": "armed"})
+                             {"mode": "notify", "notification": "armed",
+                              "deliverable": True})
             row = self.store.job_notification(response.json()["job_id"])
             self.assertEqual(row["operation"], "irradiation")
             self.assertEqual(row["email"], EMAIL_A)
@@ -550,8 +711,13 @@ class AppNotifyApiTests(unittest.TestCase):
             # The pre-existing intent stands verbatim (it was
             # recorded as a valid promise); only an intent created
             # by the recovering request itself downgrades to wait.
+            # Deliverable is False HERE, though (combined review
+            # finding 2): this app instance has no delivery
+            # configured, so the recorded promise cannot be
+            # honoured by it and the client must not repeat it.
             self.assertEqual(response.json()["completion"],
-                             {"mode": "notify", "notification": "armed"})
+                             {"mode": "notify", "notification": "armed",
+                              "deliverable": False})
             row = self.store.job_notification(job["id"])
             self.assertEqual(row["mode"], "notify")
 

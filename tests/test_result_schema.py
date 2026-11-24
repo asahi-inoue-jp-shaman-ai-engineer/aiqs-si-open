@@ -244,11 +244,32 @@ class ResultSchemaTests(unittest.TestCase):
         view = public_job_view(self.store, self.store.get(self.owner, job["id"]))
         self.assertNotIn("mode", view["result"])
         self.assertNotIn("reason", view["result"])
-        self.assertNotIn("requested_count", view["result"])
+        # Batch 2d (MEDIUM 5) contract: counts in the public view are
+        # derived from the server-side payload/progress records and
+        # included in the view; the stored legacy value is never
+        # passed through. The stored string "3" must not surface —
+        # the int 3 below is derived from the payload reservation.
+        self.assertEqual(view["result"]["requested_count"], 3)
+        self.assertIsInstance(view["result"]["requested_count"], int)
         self.assertEqual(view["result"]["completed_count"], 3)
         self.assertNotIn("stop_command_acknowledged", view["result"])
         self.assertNotIn("CANARY", json.dumps(view))
         self.assertNotIn("PRIVATE DIAGNOSTIC", json.dumps(view))
+
+    def test_public_view_drops_legacy_counts_without_payload_record(self):
+        # The fallback path of the batch-2d contract (Antigravity
+        # glass audit, view D supplement): with no payload
+        # reservation to derive from, the stored legacy figures
+        # pass through the schema sanitizer only — a string count
+        # is dropped, never published.
+        job = self.legacy_finish("legacy-view-nopayload",
+                                 {"operation": "irradiation"},
+                                 {"mode": CANARY, "requested_count": "3",
+                                  "completed_count": "3"})
+        view = public_job_view(self.store, self.store.get(self.owner, job["id"]))
+        self.assertNotIn("requested_count", view["result"])
+        self.assertNotIn("completed_count", view["result"])
+        self.assertNotIn("CANARY", json.dumps(view))
 
     def test_public_view_drops_poisoned_legacy_scan_entries(self):
         digest = self.store.save_catalog(

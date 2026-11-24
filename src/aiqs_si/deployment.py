@@ -105,6 +105,28 @@ def refuse_synthetic_in_production(environ=None, *, url=None):
         raise SyntheticForbiddenError(FORBIDDEN_MESSAGE)
 
 
+def store_in_production(store, environ=None, *, url=None):
+    """True when ANY production signal covers this store.
+
+    The composition-boundary counterpart of the synthetic
+    interlock's three signals: the environment marker / production
+    URL (production_environment) or the store's own durable
+    designation. A designation that cannot be read fails closed
+    (treated as production), matching store_designated_production's
+    contract — an unreadable designation is not an established
+    absence. Used by the policy-posture gate so a production store
+    cannot be composed with the built-in default policies merely
+    because the assembling entry point saw neither the marker nor
+    a production URL (Antigravity glass audit, finding 7).
+    """
+    if production_environment(environ, url=url):
+        return True
+    try:
+        return store_designated_production(store)
+    except DesignationUnavailable:
+        return True
+
+
 def store_designated_production(store):
     """True when the store's database durably designates itself production.
 

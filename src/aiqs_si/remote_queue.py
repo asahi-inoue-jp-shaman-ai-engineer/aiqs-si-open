@@ -6,7 +6,8 @@ import httpx
 
 
 class RemoteQueue:
-    def __init__(self, base_url, token_provider, *, client=None, diode_serial_hash=None):
+    def __init__(self, base_url, token_provider, *, client=None, diode_serial_hash=None,
+                 boundary_key=None):
         parsed = urlsplit(base_url)
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username
                 or parsed.password or parsed.query or parsed.fragment
@@ -21,6 +22,13 @@ class RemoteQueue:
             raise ValueError("Diode serial hash must be a 24-char SHA-256 hex prefix")
         self.base_url = base_url.rstrip("/")
         self.token_provider = token_provider
+        # Worker boundary credential (batch 2d, HIGH 3): when the
+        # host's credential environment supplies one, every request
+        # carries it so the service can verify this host's tokens
+        # through the reserved channel a forged-token flood cannot
+        # starve. The value is a credential: it is only ever placed
+        # in this header, never logged or put in an error.
+        self.boundary_key = boundary_key or None
         self.client = client or httpx.Client(timeout=15, follow_redirects=False, trust_env=False)
         self.diode_serial_hash = diode_serial_hash
         self.active_job = None
@@ -32,9 +40,12 @@ class RemoteQueue:
         self.client.close()
 
     def _post(self, path, body):
+        headers = {"Authorization": "Bearer " + self.token_provider()}
+        if self.boundary_key:
+            headers["X-Si-Worker-Boundary"] = self.boundary_key
         try:
             response = self.client.post(self.base_url + path, json=body,
-                                       headers={"Authorization": "Bearer " + self.token_provider()},
+                                       headers=headers,
                                        follow_redirects=False)
         except httpx.TransportError:
             raise ConnectionError("Worker queue transport unavailable") from None

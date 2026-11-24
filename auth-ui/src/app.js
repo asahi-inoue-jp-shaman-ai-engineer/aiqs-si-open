@@ -20,8 +20,8 @@ import {
 import { sessionChargeCredits } from './app-price.js';
 import { createPoller } from './app-poll.js';
 import {
-  displayedRankingEntries, elapsedText, proofHeadline, progressCountText,
-  rankingCountText, stageTextFor,
+  displayedRankingEntries, elapsedText, notifyWaitTextFor, proofHeadline,
+  progressCountText, rankingCountText, stageTextFor, waitMailNoteFor,
 } from './app-wait.js';
 import { normalizePhotoFile } from './app-image.js';
 import {
@@ -87,6 +87,15 @@ const STATE_LABEL = {
 
 export function showApp({ fetch = globalThis.fetch } = {}) {
   document.title = 'アイクスSI';
+  // 案B イマーシブ・グラス (2026-11-23): the glass design layer in
+  // style.css is scoped to this class, so the other surfaces that
+  // share the stylesheet (home, account pages) keep their look.
+  document.body.classList.add('si-app');
+  // 案B background (audit B MEDIUM-1): the browser chrome takes
+  // the immersive-glass background colour, not the legacy dark
+  // the shared shell page still declares for its other surfaces.
+  const themeMeta = document.querySelector('meta[name="theme-color"]');
+  if (themeMeta) themeMeta.setAttribute('content', '#04050e');
   // Capture the entry script's identity BEFORE the body is
   // replaced below: an entry script located in the body would
   // be gone from the document afterwards (its JS keeps running,
@@ -124,15 +133,27 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     fetch, location, history, storage: sessionStorage,
     persistentStorage: localStorage, crypto: globalThis.crypto,
   });
-  const client = createAppClient({ fetch, getToken: () => auth.getToken() });
+  const client = createAppClient({
+    fetch, getToken: () => auth.getToken(),
+    withToken: (dispatch) => auth.withCurrentToken(dispatch),
+  });
   // The purchase guide (screen-purchase) reads the existing
   // account purchase payload — the same endpoint the standalone
   // purchase page renders — with the app's own token.
-  const accountClient = createAccountClient({ fetch, getToken: () => auth.getToken() });
+  const accountClient = createAccountClient({
+    fetch, getToken: () => auth.getToken(),
+    withToken: (dispatch) => auth.withCurrentToken(dispatch),
+  });
 
   document.body.innerHTML = `<main>
-    <header><a href="/">Aiqs SI</a><span>あなたとAIの、祈りのために</span></header>
-    <section class="card"><p class="eyebrow">アイクスSI</p>
+    <div class="appbar">
+      <div class="appbar-left">
+        <button type="button" id="nav-back-button" class="glass-btn nav-back" aria-label="もどる" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
+        <a class="brand" href="/"><b>AIQS</b> SI</a>
+      </div>
+      <button type="button" id="gear-button" class="glass-btn gear-button" aria-label="メニュー（履歴・アカウント・購入）" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
+    </div>
+    <section class="stage">
       <h1 id="app-title">アイクスSI</h1>
       <p id="status" role="status" aria-live="polite">読み込んでいます。</p>
       <p id="app-step" class="step-indicator" hidden></p>
@@ -144,43 +165,15 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         </div>
       </div>
 
-      <button type="button" id="gear-button" class="gear-button" aria-label="メニュー（履歴・アカウント・購入）" hidden>⚙️</button>
-      <div id="gear-sheet" class="gear-sheet" hidden>
-        <div class="gear-panel" role="dialog" aria-label="メニュー">
-          <h2>メニュー</h2>
-          <div class="gear-list">
-            <button type="button" id="gear-history" class="choice-btn">
-              <span class="choice-name">履歴</span>
-              <span class="choice-meta">過去のスキャンと稼働証明</span>
-            </button>
-            <button type="button" id="gear-account" class="choice-btn">
-              <span class="choice-name">アカウント</span>
-              <span class="choice-meta">残高・紹介コード</span>
-            </button>
-            <button type="button" id="gear-purchase" class="choice-btn">
-              <span class="choice-name">クレジット購入</span>
-              <span class="choice-meta">残高 <span id="gear-balance">—</span></span>
-            </button>
-          </div>
-          <p class="note" id="gear-note">スキャン・照射の処理は、画面を移っても裏で続いています。結果は履歴から確認できます。</p>
-          <div class="actions"><button type="button" id="gear-close" class="secondary">閉じる</button></div>
-        </div>
-      </div>
-
-      <div id="gift-overlay" class="gift-overlay" hidden>
-        <p class="gift-emoji">🎁</p>
-        <p id="gift-text">9,999クレジットが届きました！</p>
-        <p class="note" id="gift-balance"></p>
-        <div class="actions"><button type="button" id="gift-close">閉じる</button></div>
-      </div>
-
       <div id="screen-login" hidden>
+        <div class="pulse-orb" aria-hidden="true"></div>
         <p class="lead">アイクスSIを、AIエージェントなしでそのまま使えるアプリです。スキャンは1日9回まで無料です。照射は回数分のクレジットで実行します。</p>
         <div class="actions"><button type="button" id="login-button">ログイン／新規登録</button></div>
         <p class="note">新規登録はメールアドレスと確認コードだけで完了します（招待コードは不要です）。ログイン画面で登録とログインの両方ができます。</p>
       </div>
 
       <div id="screen-home" hidden>
+        <div class="pulse-orb" aria-hidden="true"></div>
         <dl class="pairing">
           <div><dt>残高</dt><dd id="home-balance">—</dd></div>
           <div><dt>照射の単価</dt><dd id="home-price">—</dd></div>
@@ -189,7 +182,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
           <button type="button" id="home-register" hidden>まず対象を登録する</button>
           <button type="button" id="home-scan">スキャンを始める</button>
         </div>
-        <p class="note">履歴・アカウント・購入は、右上の ⚙️ からいつでも開けます。</p>
+        <p class="note">履歴・アカウント・購入は、画面下のドックからいつでも開けます。</p>
       </div>
 
       <div id="screen-account" hidden>
@@ -237,6 +230,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         </dl>
         <p>購入するパックを選んでください。1クレジット＝1円です。</p>
         <p class="note">クレジットは、支払いの確認が取れてから反映されます。反映まで数十秒かかることがあります。購入後の返金は原則としてお受けできません。</p>
+        <p class="note">ユーザー数が過密すると、クレジット単価が上がる場合もあります。</p>
         <div id="purchase-packs" class="pack-list"></div>
         <div id="purchase-linked" hidden>
           <p>D-Planetと連携済みのアカウントは、クレジットをD-Planetで購入できます。購入したクレジットは、そのままアイクスSIでも使えます。</p>
@@ -250,11 +244,11 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
 
       <div id="screen-target" hidden>
         <h2>祈りを届ける相手は誰ですか？</h2>
-        <p class="note" id="target-load-error" hidden>対象の一覧を取得できませんでした。時間をおいて、もう一度お試しください。</p>
+        <p class="note form-error" id="target-load-error" role="alert" hidden>対象の一覧を取得できませんでした。時間をおいて、もう一度お試しください。</p>
         <div id="target-choices" class="choice-list"></div>
         <p class="note" id="target-empty" hidden>登録済みの対象がありません。下のボタンから登録してください。</p>
-        <div class="actions">
-          <button type="button" id="target-add">＋ 新しい対象を登録する</button>
+        <div class="actions flow">
+          <button type="button" id="target-add">新しい対象を登録する</button>
           <button type="button" id="target-manage" class="secondary">対象の管理</button>
           <button type="button" id="target-back" class="secondary">ホームへ</button>
         </div>
@@ -264,8 +258,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       <div id="screen-target-photo" hidden>
         <h2>対象の写真を選んでください</h2>
         <p class="note">顔が分かる写真がおすすめです。写真は観測の座標になります。</p>
-        <label>写真
-          <input id="oq-photo" type="file" accept="image/*">
+        <label class="photo-pick">写真を選ぶ
+          <input id="oq-photo" class="visually-hidden" type="file" accept="image/*">
         </label>
         <p class="note" id="oq-photo-name" role="status"></p>
         <p class="note form-error" id="oq-photo-error" role="alert" hidden></p>
@@ -311,7 +305,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         </label>
         <p class="note">空欄のまま進むと、例文が自動で入ります。</p>
         <p class="note form-error" id="oq-affirmation-error" role="alert" hidden></p>
-        <div class="actions">
+        <div class="actions flow">
           <button type="button" id="oq-affirmation-next">次へ</button>
           <button type="button" id="oq-affirmation-omakase" class="secondary">おまかせにして次へ</button>
           <button type="button" id="oq-affirmation-back" class="secondary">もどる</button>
@@ -323,7 +317,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         <dl class="pairing">
           <div><dt>対象</dt><dd id="oq-sum-target">—</dd></div>
           <div><dt>意図</dt><dd id="oq-sum-intention">—</dd></div>
-          <div><dt>アファメーション</dt><dd id="oq-sum-affirmation">—</dd></div>
+          <div><dt>自己愛アファーメーション</dt><dd id="oq-sum-affirmation">—</dd></div>
           <div><dt>料金</dt><dd>無料</dd></div>
         </dl>
         <p class="note">スキャンは1日9回まで無料です。</p>
@@ -355,7 +349,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
 
       <div id="screen-targets" hidden>
         <h2>対象の管理</h2>
-        <p class="note" id="targets-load-error" hidden>対象の一覧を取得できませんでした。時間をおいて、もう一度お試しください。</p>
+        <p class="note form-error" id="targets-load-error" role="alert" hidden>対象の一覧を取得できませんでした。時間をおいて、もう一度お試しください。</p>
         <div id="target-list"></div>
         <div class="actions">
           <button type="button" id="targets-add">対象を追加する</button>
@@ -368,7 +362,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         <div class="pulse-orb" aria-hidden="true"></div>
         <p id="wait-text">順番に処理されます。そのままお待ちください。</p>
         <p class="note" id="wait-elapsed" role="status"></p>
-        <p class="note" id="wait-note">画面を閉じても、処理はそのまま続きます。結果は履歴から確認できます。</p>
+        <p class="note" id="wait-note">結果は履歴から確認できます。</p>
         <div class="skeleton" aria-hidden="true">
           <div class="skeleton-row"></div>
           <div class="skeleton-row"></div>
@@ -389,7 +383,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         <p class="note" id="ranking-count-note">共鳴ランキングの順に表示しています。</p>
         <ol id="ranking-list"></ol>
         <p class="note"><span id="ranking-notice">${NO_READING_NOTICE}</span>（<a href="${GUIDE_URL}">エージェント経由の案内</a>）</p>
-        <div class="actions">
+        <div class="actions flow">
           <button type="button" id="ranking-next">次へ</button>
           <button type="button" id="ranking-copy" class="secondary">結果をコピー</button>
           <button type="button" id="ranking-guide" class="secondary">Muse を始める（紹介コードの案内）</button>
@@ -408,7 +402,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         </dl>
         <p class="note">${READING_TRANSPARENCY}</p>
         <p class="note" id="reading-confirm-insufficient" hidden>残高が不足しています。下のボタンから購入できます。</p>
-        <div class="actions">
+        <div class="actions flow">
           <button type="button" id="reading-confirm-purchase" hidden>クレジットを購入する</button>
           <button type="button" id="reading-confirm-submit">リーディングする</button>
           <button type="button" id="reading-confirm-skip" class="secondary">しないで照射へ進む</button>
@@ -417,9 +411,9 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       </div>
 
       <div id="screen-reading-wait" hidden>
-        <h2>リーディングを作成しています</h2>
+        <h2 id="reading-wait-title">リーディングを送信しています</h2>
         <div class="pulse-orb" aria-hidden="true"></div>
-        <p>リーディングを作成しています。そのままお待ちください。</p>
+        <p id="reading-wait-text">リーディングの依頼をサーバーへ送信しています。そのままお待ちください。</p>
         <p class="note" id="reading-wait-elapsed" role="status"></p>
       </div>
 
@@ -427,8 +421,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         <h2>リーディング</h2>
         <p class="note">AIによるリーディング</p>
         <div id="reading-summary" class="reading-summary" hidden></div>
-        <p id="reading-text" style="white-space: pre-wrap"></p>
-        <div class="actions">
+        <p id="reading-text"></p>
+        <div class="actions flow">
           <button type="button" id="reading-copy" class="secondary">リーディングをコピー</button>
           <button type="button" id="reading-irradiate">照射へ進む</button>
           <button type="button" id="reading-back" class="secondary">ランキングへ戻る</button>
@@ -452,6 +446,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
           <div><dt>合計</dt><dd id="count-total">—</dd></div>
         </dl>
         <p class="note">合計は目安です。確定額は、次の確認画面で表示します。</p>
+        <p class="note">ユーザー数が過密すると、クレジット単価が上がる場合もあります。</p>
         <div class="actions">
           <button type="button" id="count-next">この回数で確認へ</button>
           <button type="button" id="count-back" class="secondary">もどる</button>
@@ -463,13 +458,14 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         <dl class="pairing">
           <div><dt>対象</dt><dd id="confirm-target">—</dd></div>
           <div><dt>インテンション</dt><dd id="confirm-intention">—</dd></div>
-          <div><dt>アファメーション</dt><dd id="confirm-affirmation">—</dd></div>
+          <div><dt>自己愛アファーメーション</dt><dd id="confirm-affirmation">—</dd></div>
           <div><dt>回数</dt><dd id="confirm-count">—</dd></div>
           <div><dt>単価</dt><dd id="confirm-unit">—</dd></div>
           <div><dt>合計</dt><dd id="confirm-total">—</dd></div>
           <div><dt>残高</dt><dd id="confirm-balance">—</dd></div>
           <div><dt>照射後の残高</dt><dd id="confirm-after">—</dd></div>
         </dl>
+        <p class="note">ユーザー数が過密すると、クレジット単価が上がる場合もあります。</p>
         <p class="note" id="confirm-insufficient" hidden>残高が不足しています（あと <span id="confirm-shortage">—</span> クレジット）。下のボタンから購入できます。</p>
         <div class="actions">
           <button type="button" id="confirm-submit">照射を始める</button>
@@ -486,7 +482,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
           <div id="progress-bar" class="progress-bar"></div>
         </div>
         <p class="note" id="progress-elapsed" role="status"></p>
-        <p class="note" id="progress-note">画面を閉じても、照射はそのまま続きます。終わったあとは、履歴から稼働証明を確認できます。</p>
+        <p class="note" id="progress-note">稼働証明は履歴から確認できます。</p>
       </div>
 
       <div id="screen-proof" hidden>
@@ -500,7 +496,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
           <div><dt>証明ダイジェスト</dt><dd id="proof-digest">—</dd></div>
           <div><dt>現在の残高</dt><dd id="proof-balance">—</dd></div>
         </dl>
-        <div class="actions">
+        <div class="actions flow">
           <button type="button" id="proof-copy">証明をコピー</button>
           <button type="button" id="proof-ranking" hidden>ランキングを見る</button>
           <button type="button" id="proof-history" class="secondary">履歴へ</button>
@@ -542,8 +538,47 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       </div>
 
       <aside><p id="app-footnote">${FOOTNOTE_FIXED}</p></aside>
+      <footer>パスワードをAIやチャットへ送る必要はありません。</footer>
     </section>
-    <footer>パスワードをAIやチャットへ送る必要はありません。</footer>
+      <div id="gear-sheet" class="gear-sheet" hidden>
+        <div class="gear-panel" role="dialog" aria-modal="true" aria-label="メニュー">
+          <h2>メニュー</h2>
+          <div class="gear-list">
+            <button type="button" id="gear-history" class="choice-btn">
+              <span class="choice-name">履歴</span>
+              <span class="choice-meta">過去のスキャンと稼働証明</span>
+            </button>
+            <button type="button" id="gear-account" class="choice-btn">
+              <span class="choice-name">アカウント</span>
+              <span class="choice-meta">残高・紹介コード</span>
+            </button>
+            <button type="button" id="gear-purchase" class="choice-btn">
+              <span class="choice-name">クレジット購入</span>
+              <span class="choice-meta">残高 <span id="gear-balance">—</span></span>
+            </button>
+          </div>
+          <p class="note" id="gear-note">結果や稼働証明は、履歴からいつでも確認できます。</p>
+          <div class="actions"><button type="button" id="gear-close" class="secondary">閉じる</button></div>
+        </div>
+      </div>
+
+      <div id="gift-overlay" class="gift-overlay" hidden>
+        <div class="gift-panel" role="dialog" aria-modal="true" aria-labelledby="gift-text">
+          <p class="gift-emoji">🎁</p>
+          <p id="gift-text">9,999クレジットが届きました！</p>
+          <p class="note" id="gift-balance"></p>
+          <div class="actions"><button type="button" id="gift-close">閉じる</button></div>
+        </div>
+      </div>
+
+    <div class="dock-zone" id="dock-zone" hidden>
+      <nav class="dock" aria-label="メインナビゲーション">
+        <button type="button" class="item" id="dock-home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>ホーム</button>
+        <button type="button" class="item" id="dock-history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>履歴</button>
+        <button type="button" class="item" id="dock-account"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>アカウント</button>
+        <button type="button" class="item" id="dock-purchase"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>購入</button>
+      </nav>
+    </div>
   </main>`;
 
   const element = (id) => document.getElementById(id);
@@ -553,6 +588,33 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     'wait-method', 'wait', 'notify-wait', 'ranking', 'reading-confirm',
     'reading-wait', 'reading-result',
     'count', 'confirm', 'progress', 'proof', 'history', 'guide', 'error'];
+  // 案B (2026-11-23): the appbar back navigation (iOS HIG /
+  // Material 3 grammar, DESIGN-NOTES 対応表) is the single back
+  // control. It dispatches to the current screen's own back
+  // button — the in-screen buttons stay in the DOM with their
+  // exact handlers and are hidden by the design layer — so back
+  // behaviour per screen is unchanged. Screens whose footer
+  // buttons are destinations rather than a way back (ranking,
+  // proof, notify-wait, error) are not in this map and keep
+  // their in-screen buttons.
+  const SCREEN_BACK = {
+    account: 'account-back',
+    purchase: 'purchase-back',
+    target: 'target-back',
+    'target-photo': 'oq-photo-back',
+    'target-name': 'oq-name-back',
+    targets: 'targets-back',
+    intention: 'oq-intention-back',
+    affirmation: 'oq-affirmation-back',
+    'scan-confirm': 'oq-confirm-back',
+    'wait-method': 'wait-method-back',
+    'reading-confirm': 'reading-confirm-back',
+    'reading-result': 'reading-back',
+    count: 'count-back',
+    confirm: 'confirm-back',
+    history: 'history-back',
+    guide: 'guide-back',
+  };
   let elapsedTimer = null;
   // Submission guards live here, not on the buttons: a busy button
   // can be bypassed by navigating back and re-entering a screen,
@@ -708,6 +770,17 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     render();
     elapsedTimer = setInterval(render, 1000);
   }
+  // The appbar back button mirrors the current screen's own
+  // back control (see SCREEN_BACK): visible only while that
+  // control is present, shown and enabled. Extracted from
+  // show() (audit B MEDIUM-3) so state changes made after
+  // show() — a back control hidden/shown mid-visit — can
+  // re-sync the appbar button instead of leaving it stale.
+  function syncNavBack(name = state.currentScreen) {
+    const backId = SCREEN_BACK[name];
+    const backControl = backId ? element(backId) : null;
+    element('nav-back-button').hidden = !(backControl && !backControl.hidden && !backControl.disabled);
+  }
   function show(name) {
     stopPoll();
     stopElapsed();
@@ -722,7 +795,24 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     // screen has no session to show a menu for), and any
     // navigation closes an open sheet.
     element('gear-button').hidden = name === 'login';
-    element('gear-sheet').hidden = true;
+    // Closing through closeGear (not a bare hidden flip) also
+    // lifts the background inert the sheet applied (gate #6).
+    // The gift modal gets the same treatment: any navigation
+    // releases it, so it can never be stranded over the
+    // destination screen with that screen left inert
+    // (delta audit HIGH-1).
+    closeGear();
+    hideGiftOverlay();
+    // 案B chrome sync (visual layer): the floating dock rides on
+    // the same screens as the gear button and marks the current
+    // destination; the appbar back button shows only when the
+    // current screen's own back control is present and visible
+    // (the reading result's back control is itself conditional).
+    element('dock-zone').hidden = name === 'login';
+    for (const item of ['home', 'history', 'account', 'purchase']) {
+      element('dock-' + item).classList.toggle('on', item === name);
+    }
+    syncNavBack(name);
     for (const screen of SCREENS) element('screen-' + screen).hidden = screen !== name;
     const step = element('app-step');
     const label = name === 'proof' ? stepLabelFor('proof', state.proofStep)
@@ -752,8 +842,38 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     state.readingPrepared = false;
   }
 
+  // Monotonic visit counter for deferred result acks (batch 2d,
+  // MEDIUM 6 round 3): every navigation retires the previous
+  // visit, and a visibility-deferred ack may fire only while
+  // the visit that produced it is still the current one.
+  let ackVisitCounter = 0;
+
+  // Navigation-intent retirement (combined review finding 4):
+  // an async navigation entry point expresses the intent BEFORE
+  // its first await, and everything the previous screen left
+  // running retires at the intent — not when the destination
+  // finally renders. The navigation generation advances (late
+  // loads discard themselves), the deferred-ack visit ends (a
+  // result the user is leaving can no longer be acked as
+  // viewed), and the previous job poll stops: its in-flight
+  // response is dropped by the poller's own generation guard,
+  // so a terminal poll can no longer override the destination
+  // the user just chose. Entry points that load before they
+  // navigate (showHome / showAccount / showTargets /
+  // showHistory / showTargetPick / showProof / the history
+  // detail load) begin their load with this; the synchronous
+  // flow intents (flowGo / flowBack / startScanFlow /
+  // startRegistration) go through it too, and navigate()
+  // itself. No navigation intent advances the navigation
+  // generation any other way (combined review round 2, F4).
+  function beginNavIntent() {
+    ackVisitCounter += 1;
+    stopPoll();
+    return navTracker.begin();
+  }
+
   function navigate(name) {
-    navTracker.begin();
+    beginNavIntent();
     // A navigation intent retires EVERY in-flight submission
     // continuation at once (S1) — including the scan flow,
     // whose tracker general navigation previously never
@@ -828,6 +948,20 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     });
   }
 
+  // A completed scan whose result could not be loaded (batch
+  // 2d, MEDIUM 8 round 3): NOT the expired screen — nothing
+  // here establishes expiry — and no result ack: the user has
+  // not seen a result. History is the recovery path.
+  function failResultUnavailable() {
+    showErrorScreen({
+      title: '結果を読み込めませんでした',
+      text: '結果の取得に失敗しました。時間をおいて、履歴から開き直してください。',
+      retryLabel: '履歴を開く',
+      onRetry: () => { void showHistory(); },
+      statusText: '結果の取得に失敗しました。',
+    });
+  }
+
   // The documented missing-scan rejection (delta review
   // round 4, N2): the server answered 404 "Scan not found" —
   // the scan the paid operation was prepared against no
@@ -871,7 +1005,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   async function showHome() {
-    const navGen = navTracker.begin();
+    const navGen = beginNavIntent();
     const data = await loadSession(navGen);
     if (!data || !navTracker.isCurrent(navGen)) return;
     element('home-balance').textContent = data.available === null || data.available === undefined
@@ -903,7 +1037,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   async function showAccount() {
-    const navGen = navTracker.begin();
+    const navGen = beginNavIntent();
     const data = await loadSession(navGen);
     if (!data || !navTracker.isCurrent(navGen)) return;
     element('account-balance').textContent = data.available === null || data.available === undefined
@@ -1060,11 +1194,21 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   async function restorePurchaseReturn() {
     const intent = takePurchaseReturn(sessionStorage);
     if (!intent || state.currentScreen !== 'home') return;
+    // Restoration ownership (combined review round 3, F4):
+    // the restore loads before it navigates, so it captures
+    // the current navigation generation and re-checks it
+    // before ANY continuation — error routing included. A
+    // newer intent expressed while the scan fetch was in
+    // flight (the replay: Rescan from home) retires the
+    // restore; its late response must not replace the screen
+    // the user has since built.
+    const restoreGen = navTracker.current();
     if (typeof intent.count === 'number') {
       state.countScanId = intent.scanId;
       state.selectedCount = intent.count;
       await showConfirm(intent.scanId);
-      if (state.currentScreen === 'confirm') {
+      if (navTracker.isCurrent(restoreGen)
+          && state.currentScreen === 'confirm') {
         status('購入から戻りました。残高を確認して、照射を始められます。');
       }
     } else {
@@ -1075,6 +1219,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       // as a context-free confirmation whose ランキングへ戻る
       // silently does nothing.
       const scanResult = await client.job(intent.scanId);
+      if (!navTracker.isCurrent(restoreGen)) return;
       if (scanResult.kind === 'login') { failToLogin(); return; }
       if (scanResult.kind !== 'ok' || scanResult.data.error
           || scanResult.data.operation !== 'scan'
@@ -1090,7 +1235,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       }
       state.scanView = scanResult.data;
       await showReadingConfirm(intent.scanId);
-      if (state.currentScreen === 'reading-confirm') {
+      if (navTracker.isCurrent(restoreGen)
+          && state.currentScreen === 'reading-confirm') {
         status('購入から戻りました。残高を確認して、リーディングを始められます。');
       }
     }
@@ -1143,7 +1289,9 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     const view = viewResult.data;
     const landing = resumeLandingFor({
       operation: redeemed.data.operation, state: view.state,
+      contentRemoved: view.content_removed === true,
     });
+    if (landing === 'expired') { failScanExpired(); return; }
     if (landing === 'ranking') { showRanking(view); return; }
     if (landing === 'scan-wait') {
       state.scanJob = jobId;
@@ -1166,24 +1314,70 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   // The gear sheet: history / account / purchase, reachable from
-  // every signed-in screen. Its note promises only what the
-  // session can actually honour: jobs continue on the server
-  // and history can reopen their results — and, only while
-  // notify is available, the completion mail (a wait-mode job
-  // left unviewed is escalated to mail by the server, a
-  // notify-mode job is mailed at completion).
+  // every signed-in screen. Its note is neutral navigation
+  // guidance only (combined review finding 3): the sheet is
+  // global, opened over whatever job state the user left
+  // behind, so it must not state that a job is still running
+  // or promise a completion mail — a completed result whose
+  // notification was already suppressed would make both
+  // claims false. Per-job state and mail wording live on the
+  // job's own screens, derived from its recorded state.
+  // Focus ownership for the sheet (Astra gate #6): while the
+  // sheet is open, the background (every sibling of the sheet
+  // inside main — appbar, stage, dock) is inert, so Tab and
+  // programmatic focus stay inside the sheet; closing restores
+  // focus to whatever held it before (normally the gear
+  // button). The element the sheet was opened from is captured
+  // on the closed→open transition only.
+  let gearReturnFocus = null;
+
+  // Focus may only return to an element that is actually
+  // visible: an element inside a since-hidden screen passes a
+  // bare !el.hidden check while being unreachable, so the
+  // whole ancestor chain is consulted (delta audit HIGH-1).
+  function isVisibleForFocus(el) {
+    if (!el || !el.isConnected) return false;
+    for (let cur = el; cur; cur = cur.parentElement) {
+      if (cur.hidden) return false;
+    }
+    return true;
+  }
+
+  function setGearBackgroundInert(sheet, inert) {
+    for (const sibling of sheet.parentElement.children) {
+      if (sibling !== sheet) sibling.inert = inert;
+    }
+  }
+
   function openGear() {
+    hideGiftOverlay();
     const available = state.session?.available;
     element('gear-balance').textContent = available === null || available === undefined
       ? '—' : `${available.toLocaleString('ja-JP')} クレジット`;
-    element('gear-note').textContent = notifyAvailable()
-      ? 'スキャン・照射の処理は、画面を移っても裏で続いています。終わったらメールでお知らせします（結果は履歴からも確認できます）。'
-      : 'スキャン・照射の処理は、画面を移っても裏で続いています。結果は履歴から確認できます。';
-    element('gear-sheet').hidden = false;
+    element('gear-note').textContent =
+      '結果や稼働証明は、履歴からいつでも確認できます。';
+    const sheet = element('gear-sheet');
+    if (sheet.hidden) {
+      gearReturnFocus = document.activeElement;
+    }
+    sheet.hidden = false;
+    setGearBackgroundInert(sheet, true);
+    element('gear-history').focus();
   }
 
   function closeGear() {
-    element('gear-sheet').hidden = true;
+    const sheet = element('gear-sheet');
+    const wasOpen = !sheet.hidden;
+    sheet.hidden = true;
+    if (!wasOpen) return;
+    setGearBackgroundInert(sheet, false);
+    // Never restore focus into an element that has since been
+    // hidden (failToLogin hides the gear button itself):
+    // focusing a hidden element is a no-op at best (MEDIUM-2).
+    if (isVisibleForFocus(gearReturnFocus)) {
+      gearReturnFocus.focus();
+    }
+    gearReturnFocus = null;
   }
 
   const REFERRAL_ERROR_TEXT = {
@@ -1194,14 +1388,48 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     cross_unconfigured: 'コードを確認できませんでした。時間をおいて、もう一度お試しください。',
   };
 
+  // The gift notice is a modal (audit B round 2,
+  // NEW-HIGH-1): it lives directly under <main> next to the
+  // gear sheet (delta audit HIGH-1 — inside .stage its
+  // stacking context trapped it under the appbar and the
+  // dock), and while it is open every sibling under <main>
+  // is inert — the same pattern as the gear sheet — with
+  // focus moving into the dialog and back out on close.
+  let giftReturnFocus = null;
+
+  function setGiftBackgroundInert(overlay, inert) {
+    for (const sibling of overlay.parentElement.children) {
+      if (sibling !== overlay) sibling.inert = inert;
+    }
+  }
+
   function showGiftOverlay(amount) {
+    closeGear();
     element('gift-text').textContent =
       `${Number(amount).toLocaleString('ja-JP')}クレジットが届きました！`;
     const available = state.session?.available;
     element('gift-balance').textContent =
       available === null || available === undefined ? ''
         : `現在の残高：${Number(available).toLocaleString('ja-JP')} クレジット`;
-    element('gift-overlay').hidden = false;
+    const overlay = element('gift-overlay');
+    if (overlay.hidden) {
+      giftReturnFocus = document.activeElement;
+    }
+    overlay.hidden = false;
+    setGiftBackgroundInert(overlay, true);
+    element('gift-close').focus();
+  }
+
+  function hideGiftOverlay() {
+    const overlay = element('gift-overlay');
+    const wasOpen = !overlay.hidden;
+    overlay.hidden = true;
+    if (!wasOpen) return;
+    setGiftBackgroundInert(overlay, false);
+    if (isVisibleForFocus(giftReturnFocus)) {
+      giftReturnFocus.focus();
+    }
+    giftReturnFocus = null;
   }
 
   async function loadReferral(navGen = null) {
@@ -1340,7 +1568,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     // A flow step change is a navigation intent (R1): it retires
     // in-flight continuations from the previous screen at once,
     // not only when the (possibly async) renderer lands.
-    navTracker.begin();
+    beginNavIntent();
     retireReadingVisit();
     state.nav.go(name);
     flowRenderers[name]?.();
@@ -1366,7 +1594,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
 
   function flowBack() {
     saveFlowEdits();
-    navTracker.begin();
+    beginNavIntent();
     retireReadingVisit();
     // Leaving mid-submission supersedes that submission: its
     // late response must not take over the flow the user has
@@ -1377,7 +1605,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   function startScanFlow() {
-    navTracker.begin();
+    beginNavIntent();
     retireReadingVisit();
     scanFlowTracker.begin();
     state.draft = createScanDraft();
@@ -1391,7 +1619,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   // stack keeps the origin so the photo step's もどる returns
   // there, and a finished registration continues into the flow.
   function startRegistration(origin) {
-    navTracker.begin();
+    beginNavIntent();
     retireReadingVisit();
     // A NEW registration starts from a fresh draft (#9): the
     // previous flow's intention/affirmation must not leak into
@@ -1405,7 +1633,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   }
 
   async function showTargetPick() {
-    const navGen = navTracker.begin();
+    const navGen = beginNavIntent();
     const loaded = await loadTargets();
     if (!loaded || !navTracker.isCurrent(navGen)) return;
     const targets = loaded.targets;
@@ -1742,23 +1970,33 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   // carries the resume link back to the result / proof. It
   // shows no address (the server never returns one) and no
   // expected time (nothing has reported one).
-  function enterNotifyWait(operation) {
+  //
+  // Every sentence derives from the submission response itself
+  // (batch 2d, MEDIUM 7): the screen used to declare
+  // "照射は進んでいます" for whatever state the job was
+  // actually in — queued, finished, failed, notification
+  // suppressed — a state the server never reported. A response
+  // that already reports a terminal state earns no notify-wait
+  // screen at all: the caller falls back to the ordinary wait /
+  // progress path, whose poller surfaces the outcome at once.
+  function enterNotifyWait(operation, data) {
+    const texts = notifyWaitTextFor({
+      operation,
+      state: data?.state,
+      notification: data?.completion?.notification,
+      deliverable: data?.completion?.deliverable === true,
+    });
+    if (!texts) return false;
     state.waitMethod = { operation, notifySuppressed: false };
-    const irradiation = operation === 'irradiation';
-    element('notify-wait-title').textContent = irradiation
-      ? '照射は進んでいます。この画面は閉じて大丈夫です'
-      : 'この画面は閉じて大丈夫です';
-    element('notify-wait-text').textContent = irradiation
-      ? '照射が終わったら、メールでお知らせします。メールのリンクから、稼働証明へそのまま進めます。'
-      : 'スキャンが終わったら、メールでお知らせします。メールのリンクから、結果へそのまま進めます。';
+    element('notify-wait-title').textContent = texts.title;
+    element('notify-wait-text').textContent = texts.text;
     navigate('notify-wait');
-    status(irradiation
-      ? '照射を受け付けました。完了はメールでお知らせします。'
-      : 'スキャンを受け付けました。完了はメールでお知らせします。');
+    status(texts.statusText);
+    return true;
   }
 
   async function showTargets() {
-    const navGen = navTracker.begin();
+    const navGen = beginNavIntent();
     const loaded = await loadTargets();
     if (!loaded || !navTracker.isCurrent(navGen)) return;
     const targets = loaded.targets;
@@ -1832,6 +2070,40 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     status(loaded.failed ? '対象の一覧を取得できませんでした' : '対象の管理');
   }
 
+  // The "I saw the result" ack (batch 2d, MEDIUM 6): the
+  // status GET is side-effect free, so a view is recorded only
+  // when a terminal result is actually rendered — the ranking,
+  // the proof, a terminal failure screen. Fire-and-forget: a
+  // failed ack must never disturb the result on screen (the
+  // worst case is a completion mail that arrives anyway), and
+  // the server itself refuses to record views for in-flight
+  // jobs, so an over-eager call site cannot cancel a mail
+  // still owed.
+  // 'unknown' is not acknowledgeable (round 2): it is an
+  // in-flight state for the poller, and its outcome may still
+  // be resolved — the server refuses to record those views too.
+  const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
+  function ackResultViewed(jobId) {
+    if (typeof jobId !== 'string' || !jobId) return;
+    // A hidden document has shown nobody anything (round 2):
+    // defer the ack until the document is actually visible.
+    // The deferral is owned by the visit that produced it
+    // (round 3): if any navigation retires that visit before
+    // the document becomes visible, the ack dies with it —
+    // the result it belonged to was never presented.
+    if (typeof document !== 'undefined' && document.hidden) {
+      const visit = ackVisitCounter;
+      document.addEventListener('visibilitychange', function onVisible() {
+        if (document.hidden) return;
+        document.removeEventListener('visibilitychange', onVisible);
+        if (ackVisitCounter !== visit) return;
+        void client.markViewed(jobId);
+      });
+      return;
+    }
+    void client.markViewed(jobId);
+  }
+
   // Poll one job: onUpdate receives each non-terminal view,
   // onTerminal the terminal view (the full payload, so callers
   // can render from it directly). The poller's generation guard
@@ -1842,16 +2114,60 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       if (result.kind === 'login') { failToLogin(); return 'stop'; }
       if (result.kind !== 'ok') { failGeneric(); return 'stop'; }
       const view = result.data;
+      // A non-2xx JSON error body (503 server_busy, 429
+      // rate_limited) also arrives as kind 'ok', carrying no
+      // state at all: it is not a job view, and treating it as
+      // a terminal one once rendered a false failure and an
+      // empty proof (Antigravity glass audit, finding 4). Only
+      // a payload with a recognized state may drive screens.
+      if (result.status < 200 || result.status >= 300
+          || !view || typeof view.state !== 'string' || view.error) {
+        failGeneric();
+        return 'stop';
+      }
       if (view.state === 'queued' || view.state === 'running' || view.state === 'unknown') {
         onUpdate(view);
         return 'continue';
       }
+      if (!TERMINAL_STATES.has(view.state)) { failGeneric(); return 'stop'; }
       onTerminal(view);
       return 'stop';
     });
   }
 
   function showRanking(view) {
+    // Usability guard at the shared entry point (batch 2d,
+    // MEDIUM 8): every route into the ranking — polling,
+    // resume landing, history, the reading screen's back path
+    // — passes through here, so the guard lives here, before
+    // any rendering or ack. A ranking may be presented only
+    // from a usable completed-scan view (operation 'scan' with
+    // a result payload). Anything else completed-shaped is
+    // routed by its evidence: explicit content removal goes to
+    // the expired screen; an incomplete or degraded view (the
+    // server's fallback shape carries operation null and no
+    // result) goes to a plain unavailable screen with NO ack —
+    // unavailability is not expiry, and an unseen result must
+    // not be recorded as seen.
+    if (view?.state === 'completed') {
+      // Explicit removal evidence takes precedence over any
+      // payload the view still carries (round 4): the cleanup
+      // that removes scan content can leave a synthesized scan
+      // object behind, and removal — not the leftover shape —
+      // is the truth about this result. The expiry branch is
+      // scan-only (round 5): the removal flag also exists on
+      // irradiation views, and an irradiation view reaching
+      // this guard (no ordinary path does) must fail usability
+      // below, not borrow the scan's expiry explanation.
+      if (view.content_removed === true && view.operation === 'scan') {
+        failScanExpired();
+        return;
+      }
+      if (!(view.operation === 'scan' && view.result?.scan)) {
+        failResultUnavailable();
+        return;
+      }
+    }
     state.scanView = view;
     // Default display is the top 10 entries (2026-11-23
     // decision); the copy action still carries the full list.
@@ -1881,6 +2197,9 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       ? readingOnNotice(reading.credits) : NO_READING_NOTICE;
     navigate('ranking');
     status('スキャンが完了しました。共鳴ランキングを表示しています。');
+    // The ack follows the completed render (round 3): it is
+    // recorded only once this ranking is actually presented.
+    ackResultViewed(view.job_id);
   }
 
   // A prepare response applies only to the reading visit that
@@ -2053,6 +2372,32 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     await runReadingSubmission(record, binding, { replay: isReplay });
   }
 
+  // The reading wait screen's wording follows the server's
+  // actual state (Astra gate #4): 'sending' while the mutation
+  // is still in flight (no acceptance yet), 'creating' only
+  // after the server answered ACCEPTED. Every submission —
+  // first send, same-key replay, recovery — starts at
+  // 'sending', so a stale 'creating' claim never carries over.
+  function setReadingWaitPhase(phase) {
+    const creating = phase === 'creating';
+    element('reading-wait-title').textContent = creating
+      ? 'リーディングを作成しています'
+      : 'リーディングを送信しています';
+    element('reading-wait-text').textContent = creating
+      ? 'リーディングを作成しています。そのままお待ちください。'
+      : 'リーディングの依頼をサーバーへ送信しています。そのままお待ちください。';
+    // The step indicator follows the same phase (Antigravity
+    // glass audit, finding 1): it is rendered from the screen
+    // name alone, so without this sync it kept the fixed
+    // 'creating' label during the send phase.
+    if (state.currentScreen === 'reading-wait') {
+      const step = element('app-step');
+      const label = stepLabelFor('reading-wait', creating ? 'creating' : 'sending');
+      step.hidden = !label;
+      step.textContent = label || '';
+    }
+  }
+
   // One reading submission attempt sequence for a frozen record:
   // the initial send plus one same-key replay after a lost
   // response. Every continuation applies only while the visit
@@ -2097,7 +2442,14 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     // Intra-visit transition: plain show() keeps the visit's
     // binding alive (navigate() would retire it).
     show('reading-wait');
-    status('リーディングを作成しています');
+    // Real-state wording (Astra gate #4): until the server has
+    // answered, the only established fact is that the request
+    // is being sent — the wait screen must not claim the
+    // reading is already being created. The wording flips to
+    // the creating phase only in the accepted branch below,
+    // once the server's acceptance is in hand.
+    setReadingWaitPhase('sending');
+    status('リーディングを送信しています');
     startElapsed('reading-wait-elapsed');
     // The client's per-call deadline bounds this await (round
     // 7): a POST whose response — body included — never lands
@@ -2191,6 +2543,11 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     if (!current()) return;
     if (outcome === 'ambiguous') { installReadingRecovery(record); return; }
     if (outcome === 'accepted') {
+      // Acceptance is now confirmed by the server's own
+      // answer: the reading really is being created from this
+      // point, so the wait screen may say so (Astra gate #4).
+      setReadingWaitPhase('creating');
+      status('リーディングを作成しています');
       void followReadingInProgress(
         record, result.data.reading_id, current, followerGeneration);
       return;
@@ -2652,7 +3009,7 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     // for: a replay can legitimately answer with the first
     // attempt's recorded mode. Notify opens the notify-wait
     // screen; anything else opens the polling wait screen.
-    if (data.completion?.mode === 'notify') { enterNotifyWait('scan'); return; }
+    if (data.completion?.mode === 'notify' && enterNotifyWait('scan', data)) return;
     enterScanWait(data);
   }
 
@@ -2672,15 +3029,37 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     // is promised only while the session can actually mail
     // (foundation item 2): a wait-mode job left unviewed is
     // escalated to a completion mail by the server.
-    element('wait-note').textContent = notifyAvailable()
-      ? '画面を閉じても大丈夫です。その場合は、終わったらメールでお知らせします。'
-      : '画面を閉じても、処理はそのまま続きます。結果は履歴から確認できます。';
+    element('wait-note').textContent = waitMailNoteFor({
+      // A response that reports no state earns the unknown
+      // wording here too, exactly like the stage text above
+      // (Antigravity glass audit, finding 3): the note must
+      // not claim the execution continues on an unreported
+      // state. Poll updates always carry a validated state.
+      operation: 'scan', completion: data.completion, state: data.state || 'unknown',
+    });
     status('スキャン受付済み');
     startElapsed('wait-elapsed');
     pollJob(data.job_id,
-      (view) => { element('wait-text').textContent = stageTextFor(view, 'スキャン'); },
+      (view) => {
+        element('wait-text').textContent = stageTextFor(view, 'スキャン');
+        // The closing note is recomputed from EVERY received
+        // view, not just the entry render (combined review
+        // finding 1): the state and the recorded notification
+        // lifecycle move while this screen is open, and a note
+        // frozen at entry can end up contradicting the stage
+        // text right above it.
+        element('wait-note').textContent = waitMailNoteFor({
+          operation: 'scan', completion: view.completion, state: view.state,
+        });
+      },
       (terminal) => {
         if (terminal.state === 'completed') { showRanking(terminal); return; }
+        // A degraded terminal view (unreadable payload: the
+        // operation did not survive the read) earns the same
+        // unavailable route as showRanking/showProof, and no
+        // ack — there is no result the owner could have seen
+        // (Antigravity glass audit, finding 4).
+        if (terminal.operation !== 'scan') { failResultUnavailable(); return; }
         showErrorScreen({
           title: 'スキャンが完了しませんでした',
           text: 'スキャンは無料です。もう一度お試しください。',
@@ -2688,6 +3067,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
           onRetry: retryRescan,
           statusText: 'スキャン失敗',
         });
+        // After the render, like every ack (round 3).
+        ackResultViewed(terminal.job_id);
       });
   }
 
@@ -2764,6 +3145,12 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   function renderCount() {
     const count = Number(element('count-slider').value);
     state.selectedCount = count;
+    // 案B slider grammar (visual only): the filled track and the
+    // active preset follow the same value the number shows.
+    element('count-slider').style.setProperty('--fill', `${((count - 1) / 98) * 100}%`);
+    for (const preset of document.querySelectorAll('.preset')) {
+      preset.classList.toggle('active', Number(preset.dataset.count) === count);
+    }
     element('count-now').textContent = String(count);
     element('count-strength').textContent = STRENGTH(count);
     const perShot = state.session?.credits_per_shot;
@@ -3170,7 +3557,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   // completion mail carry the user back to the proof; anything
   // else opens the progress screen as before.
   function landIrradiationSubmission(data, record) {
-    if (data.completion?.mode === 'notify') { enterNotifyWait('irradiation'); return; }
+    if (data.completion?.mode === 'notify'
+        && enterNotifyWait('irradiation', data)) return;
     beginIrradiationProgress(data, record);
   }
 
@@ -3205,9 +3593,10 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     // completion on the server either way. The closing note
     // promises the completion mail only while the session can
     // actually mail (foundation item 2).
-    element('progress-note').textContent = notifyAvailable()
-      ? '画面を閉じても、照射はそのまま進みます。終わったらメールでお知らせします。'
-      : '画面を閉じても、照射はそのまま続きます。終わったあとは、履歴から稼働証明を確認できます。';
+    element('progress-note').textContent = waitMailNoteFor({
+      // Same normalization as the scan entry (finding 3).
+      operation: 'irradiation', completion: data.completion, state: data.state || 'unknown',
+    });
     startElapsed('progress-elapsed');
     status('照射受付済み');
     const renderProgress = (view) => {
@@ -3222,6 +3611,14 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
           && done !== null && total !== null
         ? `照射を実行しています（${done} / ${total} 回）。`
         : stageTextFor(view, '照射');
+      // The closing note is recomputed from EVERY received
+      // view too (combined review finding 1): the terminal
+      // render below runs this BEFORE the proof load starts,
+      // so the screen can never show a completion headline
+      // over a note still claiming the irradiation continues.
+      element('progress-note').textContent = waitMailNoteFor({
+        operation: 'irradiation', completion: view.completion, state: view.state,
+      });
     };
     pollJob(data.job_id,
       (view) => { renderProgress(view); },
@@ -3245,13 +3642,24 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   // second fetch of the same job; the balance below is still
   // refreshed independently.
   async function showProof(jobId, prefetched = null) {
-    const navGen = navTracker.begin();
+    const navGen = beginNavIntent();
     let data = prefetched;
     if (!data) {
       const result = await client.job(jobId);
       if (!navTracker.isCurrent(navGen)) return;
       data = handle(result);
       if (!data) return;
+    }
+    // Degraded views earn no result presentation (batch 2d,
+    // MEDIUM 8 round 4): the server's fallback shape pairs a
+    // terminal state with an unrecognized (null) operation —
+    // rendering the proof screen from it displayed placeholder
+    // fields as a result and acknowledged it as seen. Route to
+    // the unavailable screen instead, as the ranking guard does.
+    if (TERMINAL_STATES.has(data.state)
+        && data.operation !== 'scan' && data.operation !== 'irradiation') {
+      failResultUnavailable();
+      return;
     }
     state.proofJob = data;
     state.proofStep = { operation: data.operation, state: data.state };
@@ -3286,10 +3694,18 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
     element('proof-copy-status').textContent = '';
     navigate('proof');
     status('稼働証明を表示しています。');
+    // The ack belongs HERE (batch 2d, MEDIUM 6 round 2): only
+    // once the proof screen has actually been navigated to with
+    // this job's data current — an earlier ack (before the
+    // session load above) recorded "viewed" for renders that a
+    // failed load or an intervening navigation prevented from
+    // ever being seen. The state check stays: this screen is
+    // also the in-flight detail view.
+    if (TERMINAL_STATES.has(data.state)) ackResultViewed(jobId);
   }
 
   async function showHistory() {
-    const navGen = navTracker.begin();
+    const navGen = beginNavIntent();
     const result = await client.history();
     // Ownership before handle() (R1): a late history failure
     // must not replace a newer screen with the error screen.
@@ -3320,8 +3736,13 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
       // number).
       const countPart = typeof sessionRow.count === 'number'
         ? `／${sessionRow.count.toLocaleString('ja-JP')} 回` : '';
+      // The cost and its unit are bound with a non-breaking
+      // space (audit B round 2): with a regular space the
+      // row could wrap between the number and クレジット
+      // and strand the unit on its own line. The characters
+      // themselves are unchanged.
       row.textContent = `${when.toLocaleString('ja-JP')}／${kindLabel}${countPart}／`
-        + `${STATE_LABEL[sessionRow.state] || sessionRow.state}／${sessionRow.cost.toLocaleString('ja-JP')} クレジット`;
+        + `${STATE_LABEL[sessionRow.state] || sessionRow.state}／${sessionRow.cost.toLocaleString('ja-JP')}\u00A0クレジット`;
       // The display summary (target names, intention and the
       // affirmation actually used) rides along when the history
       // API returns it (2026-11-23 decision). The API shape is
@@ -3344,12 +3765,31 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         // Detail loads are navigation too (#5): a newer
         // navigation retires this continuation before it can
         // apply a screen.
-        const detailGen = navTracker.begin();
+        const detailGen = beginNavIntent();
         if (sessionRow.operation === 'reading') {
           const result = await client.reading(sessionRow.reading_id);
           if (!navTracker.isCurrent(detailGen)) return;
           const reading = handle(result);
           if (!reading) return;
+          // History lists reserved and failed readings too:
+          // only a completed one has a result to show. Rendering
+          // the result screen for the others presented an empty
+          // reading as if it were the outcome (Antigravity
+          // glass audit, finding 5).
+          if (reading.error || reading.state !== 'completed') {
+            showErrorScreen({
+              title: reading.state === 'reserved'
+                ? 'リーディングを作成中です'
+                : 'リーディングを表示できませんでした',
+              text: reading.state === 'reserved'
+                ? '作成が完了するまで少しお待ちいただき、履歴から開き直してください。'
+                : 'このリーディングは完了していません。履歴から他の結果を確認できます。',
+              retryLabel: '履歴へもどる',
+              onRetry: () => { void showHistory(); },
+              statusText: reading.state === 'reserved' ? 'リーディング作成中' : 'リーディング未完了',
+            });
+            return;
+          }
           let scanView = null;
           if (reading.scan_id) {
             const jobResult = await client.job(reading.scan_id);
@@ -3365,6 +3805,8 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
         if (!navTracker.isCurrent(detailGen)) return;
         const view = handle(jobResult);
         if (!view) return;
+        if (view.operation === 'scan' && view.state === 'completed'
+            && view.content_removed === true) { failScanExpired(); return; }
         if (view.operation === 'scan' && view.state === 'completed') showRanking(view);
         else void showProof(sessionRow.job_id, view);
       });
@@ -3413,10 +3855,37 @@ export function showApp({ fetch = globalThis.fetch } = {}) {
   });
   element('referral-submit').addEventListener('click', () => { void submitReferral(); });
   element('gift-close').addEventListener('click', () => {
-    element('gift-overlay').hidden = true;
+    hideGiftOverlay();
   });
+  // 案B chrome wiring: the appbar back button clicks the current
+  // screen's own back control (see SCREEN_BACK), and the dock
+  // items run the same destinations as the gear sheet's rows.
+  element('nav-back-button').addEventListener('click', () => {
+    const backId = SCREEN_BACK[state.currentScreen];
+    const backControl = backId ? element(backId) : null;
+    if (backControl && !backControl.hidden && !backControl.disabled) backControl.click();
+  });
+  element('dock-home').addEventListener('click', () => { void showHome(); });
+  element('dock-history').addEventListener('click', () => { void showHistory(); });
+  element('dock-account').addEventListener('click', () => { void showAccount(); });
+  element('dock-purchase').addEventListener('click', () => { void showPurchase({ from: 'gear' }); });
   element('gear-button').addEventListener('click', openGear);
   element('gear-close').addEventListener('click', closeGear);
+  // The Escape handler replaces any previous registration:
+  // showApp() can run again on the same document (entry
+  // re-entry), and stacked anonymous listeners would each
+  // fire closeGear on every Escape (audit B MEDIUM-2).
+  if (document.__siGearKeydown) {
+    document.removeEventListener('keydown', document.__siGearKeydown);
+  }
+  document.__siGearKeydown = (event) => {
+    if (event.key !== 'Escape') return;
+    const gift = element('gift-overlay');
+    if (gift && !gift.hidden) { hideGiftOverlay(); return; }
+    const sheet = element('gear-sheet');
+    if (sheet && !sheet.hidden) closeGear();
+  };
+  document.addEventListener('keydown', document.__siGearKeydown);
   element('gear-sheet').addEventListener('click', (event) => {
     if (event.target === event.currentTarget) closeGear();
   });

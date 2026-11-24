@@ -18,11 +18,13 @@ explicit choice), or the operator must acknowledge the defaults
 with AIQS_SI_ALLOW_DEFAULT_POLICIES=1.
 """
 import json
+import math
 import os
 
 PRICING_POLICY_ENV = "AIQS_SI_PRICING_POLICY_JSON"
 GRANT_POLICY_ENV = "AIQS_SI_GRANT_POLICY_JSON"
 LIMIT_POLICY_ENV = "AIQS_SI_LIMIT_POLICY_JSON"
+ESTIMATE_POLICY_ENV = "AIQS_SI_ESTIMATE_POLICY_JSON"
 EXECUTION_PROFILES_ENV = "AIQS_SI_CORE_EXECUTION_PROFILES_JSON"
 ALLOW_DEFAULT_POLICIES_ENV = "AIQS_SI_ALLOW_DEFAULT_POLICIES"
 
@@ -69,6 +71,32 @@ def _optional_int(env_name, obj, key, *, minimum=None, default=None):
     if key not in obj or obj[key] is None:
         return default
     return _int(env_name, obj, key, minimum=minimum, default=default)
+
+
+def _number(env_name, obj, key, *, minimum=None, maximum=None,
+            positive=False, default=None):
+    """A finite JSON number (int or float, never a bool) for the
+    seconds/factor values of the estimate policy. JSON's NaN and
+    Infinity literals parse to non-finite floats and are rejected
+    here. Errors name the key only, like every loader in this
+    module."""
+    if key not in obj:
+        return default
+    value = obj[key]
+    # Integers are finite by definition and are bounded by direct
+    # comparison below; math.isfinite would convert to float and
+    # raise OverflowError on a huge JSON integer before the bounds
+    # check can reject it with the controlled error.
+    if type(value) not in (int, float) or (
+            type(value) is float and not math.isfinite(value)):
+        raise PolicyError(f"{env_name}: key {key!r} must be a finite number")
+    if positive and value <= 0:
+        raise PolicyError(f"{env_name}: key {key!r} must be positive")
+    if minimum is not None and value < minimum:
+        raise PolicyError(f"{env_name}: key {key!r} is below its minimum")
+    if maximum is not None and value > maximum:
+        raise PolicyError(f"{env_name}: key {key!r} exceeds its maximum")
+    return value
 
 
 def _str(env_name, obj, key, *, default=None, max_length=200):
@@ -305,6 +333,72 @@ def load_limit_policy(environ=None):
             LIMIT_POLICY_ENV, obj, "reading_daily_cap_per_account", minimum=0))
 
 
+class EstimatePolicy:
+    """Effective device-lane durations behind the app API's duration
+    estimates (foundation item 3, 2026-11-23).
+
+    The seconds values are OPERATOR-MEASURED effective durations,
+    deliberately NOT the device settings stamped into job payloads:
+    the effective end-to-end duration of one irradiation shot on
+    the lane exceeds its configured device seconds once device
+    handling and server round trips are counted, and a scan has
+    its own measured constant.
+    Deriving the estimate from the 9-second setting would present a
+    number the real device does not meet — the estimate must mirror
+    the real machine, so the measured values live here as operator
+    configuration, maintainable without a code change.
+
+    Either seconds value is None until the operator sets it, and
+    None means "no estimate exists": the API answers null instead
+    of inventing a figure. The range factors widen the nominal
+    total into the [min, max] band the UI presents; the band is a
+    range on purpose, never a point promise."""
+
+    def __init__(self, *, scan_seconds, irradiation_seconds_per_shot,
+                 range_low_factor, range_high_factor):
+        self.scan_seconds = scan_seconds
+        self.irradiation_seconds_per_shot = irradiation_seconds_per_shot
+        self.range_low_factor = range_low_factor
+        self.range_high_factor = range_high_factor
+
+
+def load_estimate_policy(environ=None):
+    environ = os.environ if environ is None else environ
+    obj = _load_object(environ, ESTIMATE_POLICY_ENV)
+    if obj is None:
+        return EstimatePolicy(scan_seconds=None,
+                              irradiation_seconds_per_shot=None,
+                              range_low_factor=0.8, range_high_factor=1.6)
+    _reject_unknown(ESTIMATE_POLICY_ENV, obj,
+                    {"scan_seconds", "irradiation_seconds_per_shot",
+                     "range_low_factor", "range_high_factor"})
+
+    def seconds(key, maximum):
+        # An explicit null is the operator's recorded "no measured
+        # value" (the _optional_int convention of the limit policy):
+        # that operation simply has no estimate.
+        if key in obj and obj[key] is None:
+            return None
+        return _number(ESTIMATE_POLICY_ENV, obj, key,
+                       positive=True, maximum=maximum)
+
+    low = _number(ESTIMATE_POLICY_ENV, obj, "range_low_factor",
+                  positive=True, maximum=1, default=0.8)
+    high = _number(ESTIMATE_POLICY_ENV, obj, "range_high_factor",
+                   minimum=1, maximum=5, default=1.6)
+    if not low < high:
+        # Equal or inverted factors would present the range as a
+        # point promise; the estimate must keep its width.
+        raise PolicyError(
+            f"{ESTIMATE_POLICY_ENV}: range_low_factor must be below "
+            "range_high_factor")
+    return EstimatePolicy(
+        scan_seconds=seconds("scan_seconds", 86400),
+        irradiation_seconds_per_shot=seconds(
+            "irradiation_seconds_per_shot", 3600),
+        range_low_factor=low, range_high_factor=high)
+
+
 def policy_posture_problems(environ=None):
     """Startup posture check (Astra final round #5): the money- and
     exposure-bearing policies must be EXPLICIT in the deployment
@@ -340,21 +434,42 @@ def policy_posture_problems(environ=None):
         problems.append(
             f"{PRICING_POLICY_ENV}: not set; built-in default prices "
             "would apply silently")
-    elif pricing != "invalid" and not (
-            "credits_per_shot_tenths" in pricing or "credits_per_shot" in pricing):
-        problems.append(
-            f"{PRICING_POLICY_ENV}: does not set a shot rate "
-            "('credits_per_shot_tenths'); the default rate would apply silently")
+    elif pricing != "invalid":
+        if not ("credits_per_shot_tenths" in pricing
+                or "credits_per_shot" in pricing):
+            problems.append(
+                f"{PRICING_POLICY_ENV}: does not set a shot rate "
+                "('credits_per_shot_tenths'); the default rate would apply silently")
+        # Partial specification is not explicit (batch 2d,
+        # MEDIUM 4): the purchase packs, the per-session shot
+        # ceiling and the reading price are money-bearing too,
+        # and each silently inherited its default while only the
+        # rate was pinned.
+        for key in ("purchase_packs", "max_shots", "reading_credits"):
+            if key not in pricing:
+                problems.append(
+                    f"{PRICING_POLICY_ENV}: does not set {key!r}; "
+                    "the default would apply silently")
 
     grant = parsed(GRANT_POLICY_ENV)
     if grant is None:
         problems.append(
             f"{GRANT_POLICY_ENV}: not set; built-in default grant "
             "amounts would apply silently")
-    elif grant != "invalid" and "referral_credits" not in grant:
-        problems.append(
-            f"{GRANT_POLICY_ENV}: does not set 'referral_credits'; "
-            "the default grant amount would apply silently")
+    elif grant != "invalid":
+        if "referral_credits" not in grant:
+            problems.append(
+                f"{GRANT_POLICY_ENV}: does not set 'referral_credits'; "
+                "the default grant amount would apply silently")
+        # The Phase A grant invariants are exposure-bearing: a
+        # cap left unmentioned is dormant by default, which must
+        # be a recorded choice (a number, or an explicit null
+        # for monitored-unlimited), not an omission.
+        for key in ("referral_cap_per_inviter", "total_budget"):
+            if key not in grant:
+                problems.append(
+                    f"{GRANT_POLICY_ENV}: does not set {key!r}; set a "
+                    "number or an explicit null (dormant, monitored)")
 
     limit = parsed(LIMIT_POLICY_ENV)
     if limit is None:
@@ -363,12 +478,27 @@ def policy_posture_problems(environ=None):
             "(unlimited) would apply silently")
     elif limit != "invalid":
         for key in ("scan_daily_quota_per_account",
-                    "scan_exposure_budget_total"):
+                    "scan_exposure_budget_total",
+                    "reading_daily_cap_per_account"):
             if key not in limit:
                 problems.append(
                     f"{LIMIT_POLICY_ENV}: does not set {key!r}; set a "
                     "number or an explicit null (unlimited, monitored)")
     return problems
+
+
+def enforce_policy_posture(environ=None):
+    """Raise ValueError unless the policy posture is explicit.
+
+    The CLI entry point has enforced this since batch 2c; the
+    composition factories enforce it too (batch 2d, MEDIUM 4),
+    so an ASGI/MCP composition assembled in code cannot bring
+    the built-in defaults into a production deployment silently
+    just because it never passed through the CLI."""
+    problems = policy_posture_problems(environ)
+    if problems:
+        raise ValueError(
+            "Operator policy posture incomplete: " + "; ".join(problems))
 
 
 _PROFILE_KEYS = {"cycles", "top_mfs", "top_entries", "qrs_threshold",

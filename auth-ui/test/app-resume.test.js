@@ -95,4 +95,28 @@ test('resumeLandingFor follows the job view state for each operation', () => {
   assert.equal(resumeLandingFor({ operation: 'reading', state: 'completed' }), null);
   assert.equal(resumeLandingFor({}), null);
   assert.equal(resumeLandingFor(), null);
+  // A state the client does not know earns no landing either
+  // (Antigravity glass audit, finding 10): the recognized
+  // states are the in-flight set and the terminal set only.
+  assert.equal(resumeLandingFor({ operation: 'scan', state: 'bogus' }), null);
+  assert.equal(resumeLandingFor({ operation: 'irradiation', state: 'bogus' }), null);
+  assert.equal(resumeLandingFor({ operation: 'scan', state: undefined }), null);
+  assert.equal(resumeLandingFor({ operation: 'irradiation', state: undefined }), null);
+});
+
+
+test('resumeLandingFor lands an expired scan on the expired screen (batch 2d MEDIUM 8)', () => {
+  // The resume link lives 7 days; scan content is removed
+  // after 24 hours. A completed scan whose content is gone
+  // must not open the (empty) ranking as if it were a result.
+  assert.equal(resumeLandingFor(
+    { operation: 'scan', state: 'completed', contentRemoved: true }), 'expired');
+  assert.equal(resumeLandingFor(
+    { operation: 'scan', state: 'completed', contentRemoved: false }), 'ranking');
+  assert.equal(resumeLandingFor(
+    { operation: 'scan', state: 'completed' }), 'ranking');
+  // Removal is a scan-content concept; irradiation landings
+  // are unaffected by the flag.
+  assert.equal(resumeLandingFor(
+    { operation: 'irradiation', state: 'completed', contentRemoved: true }), 'proof');
 });

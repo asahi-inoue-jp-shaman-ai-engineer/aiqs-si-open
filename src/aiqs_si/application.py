@@ -5,8 +5,10 @@ from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 from starlette.responses import JSONResponse
 from starlette.middleware import Middleware
-from .request_limits import RequestBodyLimit
+from .request_limits import RequestBodyLimit, worker_boundary_key_from_env
 from .auth import create_http_server
+from .deployment import production_environment, store_in_production
+from .policies import enforce_policy_posture
 from .worker_api import create_worker_app
 from starlette.datastructures import MutableHeaders
 
@@ -43,10 +45,20 @@ def create_application(store, user_verifier, worker_verifier, *, allowed_workers
                        onboarding_config=None, onboarding_binding=None, onboarding_hook_secret=None,
                        internal_link_key=None, dplanet_client=None, payment_links=None,
                        wellknown_transport=None, reading_provider=None,
-                       notification_mailer=None):
+                       notification_mailer=None, estimate_policy=None):
     allowed_workers = frozenset(allowed_workers)
     if user_verifier.audience == worker_verifier.audience:
         raise ValueError("User and worker audiences must be distinct")
+    # Policy posture at the composition boundary (batch 2d,
+    # MEDIUM 4): the CLI gate alone left every other composition
+    # — ASGI assembled in code, tests promoted to production,
+    # embedded MCP — free to run on the built-in default
+    # policies silently. A production signal (the deployment
+    # marker, or the production issuer) now requires the same
+    # explicit posture here.
+    if (store_in_production(store, url=user_verifier.issuer)
+            or production_environment(url=worker_verifier.issuer)):
+        enforce_policy_posture()
     if billing is not None and billing.store is not store:
         raise ValueError('Billing and account store must match')
     onboarding = None
@@ -112,6 +124,10 @@ def create_application(store, user_verifier, worker_verifier, *, allowed_workers
     notification_delivery = build_notification_delivery(
         store, mailer=notification_mailer)
     store.notification_delivery = notification_delivery
+    # Duration estimates (foundation item 3): the policy is loaded
+    # from the env by the estimates module; tests inject a measured
+    # policy explicitly. Unset seconds values disable the estimate
+    # per operation — the API answers null rather than a guess.
     standalone = app_routes(store, user_verifier, service=service,
                             dplanet_client=dplanet_client,
                             dplanet_routing=routing_enabled_from_env(),
@@ -119,12 +135,14 @@ def create_application(store, user_verifier, worker_verifier, *, allowed_workers
                             reading_service=reading_service,
                             reading_enabled=reading_enabled,
                             referral_enabled=referral_enabled_from_env(),
-                            notify_configured=notification_delivery is not None)
+                            notify_configured=notification_delivery is not None,
+                            estimate_policy=estimate_policy)
     from .web_ui import ui_routes
     public_routes = ui_routes(ui_directory, user_verifier.issuer,
                               app_enabled=app_enabled) if ui_directory else []
     middleware = [Middleware(RequestBodyLimit, worker_verifier=worker_verifier, allowed_workers=allowed_workers,
-                             account_verifier=user_verifier)]
+                             account_verifier=user_verifier,
+                             worker_boundary_key=worker_boundary_key_from_env())]
     if onboarding is not None:
         middleware.append(Middleware(_OnboardingDispatch, onboarding=onboarding))
     from .wellknown import wellknown_routes

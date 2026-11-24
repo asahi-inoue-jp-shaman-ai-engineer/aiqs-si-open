@@ -21,11 +21,31 @@
 // token is ignored, and a successful adoption clears any persisted
 // session so a stale refresh token from another account cannot
 // resurrect underneath the handed-over session.
+//
+// Cross-tab discipline (batch 2d, HIGH 1): the generation fence
+// above is per-instance, but the persisted session is shared by
+// every tab — so a refresh in flight in tab 1 for account A could
+// still land (and re-persist A's rotated token) after tab 2 had
+// adopted account B, and the next load resurrected A. A shared
+// revision record in the same storage now fences the commit:
+// every persist or clear of the shared session writes a FRESH
+// RANDOM revision (round 2: a numeric epoch dies at 2^53, where
+// +1 is a no-op and the fence silently stops moving — a string
+// revision is only ever compared for equality), a token request
+// captures the revision when it starts and discards its response
+// if the revision moved, and a tab whose in-memory session is
+// bound to an older revision drops it instead of acting on it —
+// fragment-only sessions included: they hold no refresh token,
+// but they are bound to the revision their adoption wrote, and
+// another tab's later write supersedes them all the same. A
+// stale tab also never clears a shared session that is no
+// longer its own.
 import { ensureFragmentHandoff, takeFragmentToken } from './account-session.js';
 
 const CLIENT_ID = 'si-app';
 const PENDING_KEY = 'si-app-pkce-v1';
 const SESSION_KEY = 'si-app-session-v1';
+const EPOCH_KEY = 'si-app-session-epoch-v1';
 const REFRESH_MARGIN_MS = 60000;
 
 function base64url(bytes) {
@@ -59,6 +79,52 @@ export function createAppAuth({
   // silently resurrect that account (tokens and persisted refresh
   // token alike).
   let generation = 0;
+  // This instance's identity in the shared revision record:
+  // writes carrying another instance's id are how a tab learns
+  // that a DIFFERENT tab rotated, replaced, or cleared the
+  // shared session underneath it.
+  const instanceId = base64url(crypto.getRandomValues(new Uint8Array(8)));
+  // The revision this instance's in-memory session is bound to:
+  // the revision its own latest write produced, or the revision
+  // current when it loaded the persisted session. Another
+  // instance's write moves the shared revision past it.
+  let boundRevision = null;
+
+  function readSharedRecord() {
+    if (!persistentStorage) return null;
+    try {
+      const saved = JSON.parse(persistentStorage.getItem(EPOCH_KEY) || 'null');
+      if (saved && typeof saved === 'object') {
+        if (typeof saved.rev === 'string' && saved.rev) {
+          return { rev: saved.rev, owner: saved.owner };
+        }
+        // Legacy numeric-epoch records (round 1) still fence by
+        // equality: their value becomes the revision string.
+        if (typeof saved.epoch === 'number') {
+          return { rev: `legacy:${saved.epoch}`, owner: saved.owner };
+        }
+      }
+    } catch { /* corrupted entry: treated as no record */ }
+    return null;
+  }
+
+  function sharedRevision() {
+    const record = readSharedRecord();
+    return record ? record.rev : null;
+  }
+
+  function advanceSharedRevision(kind) {
+    if (!persistentStorage) return null;
+    const rev = base64url(crypto.getRandomValues(new Uint8Array(16)));
+    try {
+      persistentStorage.setItem(EPOCH_KEY, JSON.stringify({
+        rev, owner: instanceId, kind, at: Date.now(),
+      }));
+      boundRevision = rev;
+      return rev;
+    } catch { /* storage full/blocked: the fence degrades, never throws */ }
+    return null;
+  }
 
   function persistRefreshToken() {
     if (!persistentStorage || !refreshToken) return;
@@ -66,6 +132,7 @@ export function createAppAuth({
       persistentStorage.setItem(SESSION_KEY, JSON.stringify({
         refreshToken, savedAt: Date.now(),
       }));
+      advanceSharedRevision('persist');
     } catch { /* storage full/blocked: session stays memory-only */ }
   }
 
@@ -82,7 +149,31 @@ export function createAppAuth({
 
   function clearPersistedSession() {
     if (!persistentStorage) return;
-    try { persistentStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+    try {
+      persistentStorage.removeItem(SESSION_KEY);
+      advanceSharedRevision('clear');
+    } catch { /* ignore */ }
+  }
+
+  // Whether another tab has rotated, replaced, or cleared the
+  // shared session this instance's in-memory session belongs
+  // to. My own writes never count (the record carries my id).
+  // Sessions without a refresh token — fragment handoffs — are
+  // covered through their bound revision: their adoption wrote
+  // the record, and any later foreign write moves past it.
+  function sharedSessionSuperseded() {
+    if (!persistentStorage) return false;
+    if (!accessToken && !refreshToken) return false;
+    const record = readSharedRecord();
+    if (!record) return false;
+    if (record.owner === instanceId) return false;
+    return record.rev !== boundRevision;
+  }
+
+  function dropInMemorySession() {
+    generation += 1;
+    accessToken = null; refreshToken = null; expiresAt = 0;
+    boundRevision = null;
   }
 
   function adopt(data, fallbackLifetimeSeconds = 3600) {
@@ -98,11 +189,21 @@ export function createAppAuth({
     return true;
   }
 
-  // 'ok' | 'rejected' | 'error' — a rejection means the server
-  // refused the grant (e.g. an expired/revoked refresh token);
-  // an error means the exchange never completed (network/parse).
+  // 'ok' | 'rejected' | 'error' | 'superseded' — a rejection
+  // means the server refused the grant (e.g. an expired/revoked
+  // refresh token); an error means the exchange never completed
+  // (network/parse); 'superseded' means the shared-revision
+  // fence discarded the response because another tab moved the
+  // shared session while the request was in flight.
   async function tokenRequest(params) {
     const requestedGeneration = generation;
+    // The shared-revision fence (batch 2d, HIGH 1): if any tab
+    // persisted or cleared the shared session while this request
+    // was in flight, the response belongs to a superseded
+    // session and is discarded WITHOUT adopting — above all
+    // without re-persisting its refresh token over the newer
+    // tab's session.
+    const requestedRevision = sharedRevision();
     let response;
     try {
       response = await fetch(tokenUrl, {
@@ -113,10 +214,12 @@ export function createAppAuth({
       });
     } catch { return 'error'; }
     if (requestedGeneration !== generation) return 'error';
+    if (sharedRevision() !== requestedRevision) return 'superseded';
     if (!response.ok) return 'rejected';
     let data = null;
     try { data = await response.json(); } catch { data = null; }
     if (requestedGeneration !== generation) return 'error';
+    if (sharedRevision() !== requestedRevision) return 'superseded';
     return adopt(data) ? 'ok' : 'error';
   }
 
@@ -155,36 +258,138 @@ export function createAppAuth({
   }
 
   async function refresh() {
-    if (!refreshToken) refreshToken = loadPersistedRefreshToken();
+    if (!refreshToken) {
+      refreshToken = loadPersistedRefreshToken();
+      // Loading the shared session binds this instance to the
+      // revision current at the load: another tab's later write
+      // is what supersedes it, not the load itself.
+      if (refreshToken) boundRevision = sharedRevision();
+    }
     if (!refreshToken) return null;
     const requestedGeneration = generation;
-    const outcome = await tokenRequest({
-      grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token: refreshToken,
+    let sentToken = refreshToken;
+    let outcome = await tokenRequest({
+      grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token: sentToken,
     });
     // The session may have been replaced while the request was in
     // flight (fragment handoff, sign-out): the outcome then belongs
     // to the previous account and must not mutate the new session —
     // in particular a stale 'rejected' must not clear it.
     if (requestedGeneration !== generation) return null;
+    if (outcome === 'error' || outcome === 'superseded') {
+      // A discard by the shared-revision fence most often means
+      // another tab rotated the shared session first: its newer
+      // persisted token is the live one, so retry once with it
+      // instead of reporting a spurious sign-out. A cleared
+      // session (no persisted token) is not retried — and a
+      // fenced discard with nothing newer to adopt means this
+      // instance's session is gone, not merely unrefreshed.
+      const persisted = loadPersistedRefreshToken();
+      if (persisted && persisted !== sentToken) {
+        // Switching to a DIFFERENT session's refresh token
+        // retires the old session's access token with it
+        // (round 3): credentials and their binding are one
+        // unit. Retaining the old access token let a failed
+        // retry fall through to serving the SUPERSEDED
+        // account's token — the revision check passes because
+        // the binding now matches the winner, while the token
+        // still belongs to the loser.
+        accessToken = null;
+        expiresAt = 0;
+        refreshToken = persisted;
+        boundRevision = sharedRevision();
+        sentToken = persisted;
+        outcome = await tokenRequest({
+          grant_type: 'refresh_token', client_id: CLIENT_ID,
+          refresh_token: persisted,
+        });
+        if (requestedGeneration !== generation) return null;
+      } else if (outcome === 'superseded') {
+        dropInMemorySession();
+        return null;
+      }
+    }
     if (outcome === 'ok') return accessToken;
     if (outcome === 'rejected') {
+      // Clear the shared session only while it is still THIS
+      // persisted session: another tab may already have replaced
+      // it with its own, and a stale rejection must not wipe
+      // that. An ABSENT persisted token is not ownership either
+      // (Antigravity glass audit, finding 6): a fragment-only
+      // session in another tab holds no SESSION_KEY and is
+      // fenced solely by the shared revision, so advancing the
+      // revision here would force that tab out.
+      const stillOwnsShared = !sharedSessionSuperseded()
+        && loadPersistedRefreshToken() === sentToken;
       accessToken = null; refreshToken = null; expiresAt = 0;
-      clearPersistedSession();
+      boundRevision = null;
+      if (stillOwnsShared) {
+        clearPersistedSession();
+      }
     }
     // 'error': keep the persisted session; the next call retries.
     return null;
   }
 
   async function getToken() {
+    // Cross-tab sync (batch 2d, HIGH 1): if another tab rotated,
+    // replaced, or cleared the shared session, this tab's
+    // in-memory credentials belong to a superseded session —
+    // drop them and let the persisted state (if any) drive the
+    // refresh below, instead of acting on the stale account.
+    if (sharedSessionSuperseded()) dropInMemorySession();
     if (accessToken && Date.now() < expiresAt - REFRESH_MARGIN_MS) return accessToken;
     if (refreshToken || loadPersistedRefreshToken()) {
       if (!refreshPromise) {
         refreshPromise = refresh().finally(() => { refreshPromise = null; });
       }
-      const refreshed = await refreshPromise;
-      if (refreshed) return refreshed;
+      await refreshPromise;
+      // The supersession check runs after EVERY awaited
+      // refresh, on the success path too (round 4): a refresh
+      // can pass both of its own fences and adopt, and another
+      // tab can still replace the shared session in the
+      // microtask gap before this caller resumes — returning
+      // the captured result would serve the superseded account.
+      // What is served is the CURRENT in-memory token, and only
+      // while the session it belongs to is still the shared one.
+      if (sharedSessionSuperseded()) {
+        dropInMemorySession();
+        return null;
+      }
     }
     return accessToken && Date.now() < expiresAt ? accessToken : null;
+  }
+
+  // Dispatch an authenticated request under the CURRENT
+  // session (round 5): the caller hands over a dispatch
+  // callback that receives the token (or null) and must invoke
+  // the request synchronously. A bearer string obtained from
+  // getToken() crosses promise boundaries before its consumer
+  // dispatches, and a session replacement scheduled through
+  // any task/microtask boundary could land in that gap and be
+  // answered with the superseded account's token. Here the
+  // final supersession fence, the selection of the current
+  // token, and the dispatch invocation happen in ONE
+  // synchronous block after all awaited refresh work: a
+  // replacement scheduled through any task or microtask
+  // boundary lands either before the fence (honored — the
+  // session is dropped and the dispatch receives null) or
+  // after the request has been dispatched under the session
+  // that was current at the fence. Scoped limitation, stated
+  // plainly: a foreign commit overlapping the fence-to-fetch
+  // interval itself — a write completing concurrently from
+  // another tab's thread — can still permit dispatch with
+  // the superseded token; excluding that needs a cross-tab
+  // lock protocol over every commit path, which this design
+  // does not adopt (see docs/implementation-notes.md,
+  // batch 2d).
+  async function withCurrentToken(dispatch) {
+    await getToken();
+    if (sharedSessionSuperseded()) {
+      dropInMemorySession();
+      return dispatch(null);
+    }
+    return dispatch(accessToken && Date.now() < expiresAt ? accessToken : null);
   }
 
   function hasPersistedSession() {
@@ -212,7 +417,7 @@ export function createAppAuth({
   }
 
   return Object.freeze({
-    completeRedirect, takeFragment, getToken, beginLogin,
+    completeRedirect, takeFragment, getToken, withCurrentToken, beginLogin,
     hasPersistedSession, clearSession,
   });
 }

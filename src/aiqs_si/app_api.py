@@ -42,9 +42,12 @@ from starlette.routing import Route
 
 from .auth import resolve_account
 from .dplanet import DPlanetError
+from .estimates import (current_policy as current_estimate_policy,
+                        duration_estimate)
 from .pricing import (CAMPAIGN_ACTIVE, CAMPAIGN_NAME, CREDITS_PER_SHOT,
-                      PRICE_VERSION, READING_CREDITS, active_credits_per_shot,
-                      active_rate_tenths, irradiation_quote, reading_quote)
+                      MAX_SHOTS, PRICE_VERSION, READING_CREDITS,
+                      active_credits_per_shot, active_rate_tenths,
+                      irradiation_quote, reading_quote)
 from .reading import ReadingGenerationError
 from .referral import ReferralError
 from .scan_rejections import scan_error_code
@@ -82,7 +85,8 @@ def _iso(epoch):
 def app_routes(store, verifier, *, service, dplanet_client=None,
                dplanet_routing=False, enabled=True,
                reading_service=None, reading_enabled=False,
-               referral_enabled=False, notify_configured=False):
+               referral_enabled=False, notify_configured=False,
+               estimate_policy=None):
     """User-authenticated app routes for the combined application.
 
     The reading routes (native-reading-design-20261122) exist only
@@ -137,11 +141,57 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
     def completion_view(job_id):
         """The choice as recorded (first record wins), plus the
         notification lifecycle state. The address itself is never
-        part of any response."""
+        part of any response. `deliverable` is the per-job mail
+        eligibility the client may promise on (combined review
+        finding 2): a promise state (armed / queued / sending)
+        can actually be mailed only while delivery is configured
+        AND the record carries an address AND the result has not
+        been viewed — a wait-mode job recorded without an address
+        sits armed forever, because the escalation requires one,
+        and a viewed record is suppressed by the delivery gate,
+        so the client must not promise either mail."""
         row = store.job_notification(job_id)
         if row is None:
-            return {"mode": "wait", "notification": "none"}
-        return {"mode": row["mode"], "notification": row["status"]}
+            return {"mode": "wait", "notification": "none",
+                    "deliverable": False}
+        # A viewed record is not deliverable either (round 2):
+        # the delivery gate suppresses every viewed record, but
+        # the view ack deliberately keeps a 'sending' record's
+        # status and address (the mail may already be on the
+        # wire), so eligibility must consult the view stamp
+        # itself, not just status + address.
+        deliverable = bool(
+            notify_configured
+            and row["status"] in ("armed", "queued", "sending")
+            and row["email"]
+            and row["viewed_at"] is None)
+        return {"mode": row["mode"], "notification": row["status"],
+                "deliverable": deliverable}
+
+    active_estimate_policy = estimate_policy if estimate_policy is not None \
+        else current_estimate_policy()
+
+    def estimate_sync(operation, count=None, *, before_job_id=None,
+                      owner=None):
+        """The duration estimate for a confirmation or waiting
+        screen (foundation item 3): a range in seconds including
+        the queue wait, or None when the server has no honest basis
+        (estimate policy unset, no worker known to be polling, the
+        lane blocked by an unresolved execution, an unreadable job
+        ahead). A missing basis never
+        raises here: the estimate is display material, and its
+        absence must not fail the screen it decorates."""
+        try:
+            return duration_estimate(
+                store, operation, count, policy=active_estimate_policy,
+                before_job_id=before_job_id, owner=owner)
+        except (KeyError, ValueError, TypeError, RecursionError,
+                sqlite3.Error):
+            # sqlite3.Error included: the estimate decorates screens
+            # that may already have committed a paid submission, and
+            # a transient database lock must not turn that into a
+            # 500 (Antigravity glass audit, finding 9).
+            return None
 
     def balance_view(owner):
         """The credit_balance semantics of the MCP surface: while
@@ -190,9 +240,19 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                 "intention": display["intention"],
                 "self_love_joy": display["self_love_joy"],
                 "targets": display["targets"],
+                "content_removed": False,
+                # The notification record is independent of the
+                # unreadable payload, so the completion view is
+                # still answerable — and must be present: a view
+                # without it once let the client fall back to a
+                # session-level mail promise (round 2, F2).
+                "completion": completion_view(job_id),
                 "execution": None, "device": None, "settlement": None,
                 "proof_digest": None,
                 "consent": attributed["consent"] if attributed else None,
+                # The payload is unreadable, so this job's own
+                # duration basis is gone with it: no estimate.
+                "estimate": None,
                 "queue": {"position": queue["position"],
                           "jobs_ahead": queue["jobs_ahead"]}}
 
@@ -204,22 +264,37 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         attributed = store.app_job(job_id)
         try:
             job = store.get(owner, job_id)
-            if job["state"] in ("completed", "failed", "cancelled", "unknown"):
-                # Seeing the terminal state is the "the user is back"
-                # signal: a pending completion notification for a result
-                # already on screen would be a lie about needing one.
-                # The view is recorded durably, independent of whether
-                # a notification record exists yet.
-                store.mark_result_viewed(owner, job_id)
+            # This read is SIDE-EFFECT FREE (batch 2d, MEDIUM 6):
+            # it used to record "the user saw the result" itself,
+            # so the status polling behind the wait screens — a
+            # GET every few seconds — marked every finished job
+            # viewed the moment it completed, and a user who had
+            # closed the screen before that poll never received
+            # the escalation mail the wait choice promised. The
+            # view is now recorded only by the explicit ack
+            # (POST /jobs/{id}/viewed), which the client sends
+            # when a terminal result is actually rendered.
             proof = store.execution_proof(owner, job_id)
             view = public_job_view(store, job)
             queue = store.queue_status(owner, job_id)
             display = store.display_summary(owner, job)
+            # The remaining-time estimate is offered only while the
+            # job is still queued: once it is running, the server
+            # holds no durable start it could bound the remainder
+            # from, and a terminal job needs no estimate at all.
+            payload = job.get("payload")
+            estimate = estimate_sync(
+                view.get("operation"),
+                payload.get("irradiation_count")
+                if isinstance(payload, dict) else None,
+                before_job_id=job_id, owner=owner) \
+                if job["state"] == "queued" else None
             result_view = {
                 "job_id": job_id, "operation": view.get("operation"),
                 "state": job["state"], "cost": job["cost"],
                 "result": view.get("result"),
                 "completion": completion_view(job_id),
+                "estimate": estimate,
                 # The user's own words, returned to themself only:
                 # the §4.2 copy format heads the ranking with the
                 # intention and self-love affirmation the user typed.
@@ -232,6 +307,14 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
                 "intention": display["intention"],
                 "self_love_joy": display["self_love_joy"],
                 "targets": display["targets"],
+                # Whether the job's content has been removed by
+                # the 24-hour scan expiry (batch 2d, MEDIUM 8): a
+                # completed scan whose payload is the expiry
+                # tombstone has no ranking left to show, and the
+                # client must say so instead of rendering an
+                # empty "success" ranking.
+                "content_removed": bool(
+                    job["payload"].get("content_removed")),
                 "execution": proof["execution"], "device": proof["device"],
                 "settlement": proof["settlement"],
                 "proof_digest": proof["proof_digest"],
@@ -254,12 +337,10 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             # rejects non-finite payload numbers, and the encoding
             # preflight raises UnicodeEncodeError (a ValueError)
             # on unencodable payload-derived strings — all are
-            # stored-data failures this read must survive.
-            degraded = degraded_job_view(owner, job_id, attributed)
-            if degraded["state"] in ("completed", "failed", "cancelled",
-                                        "unknown"):
-                store.mark_result_viewed(owner, job_id)
-            return degraded
+            # stored-data failures this read must survive. The
+            # degraded read is side-effect free for the same
+            # reason as the strict one (batch 2d, MEDIUM 6).
+            return degraded_job_view(owner, job_id, attributed)
         return result_view
 
     async def session(request):
@@ -277,6 +358,15 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         # claim). The UI hides the choice when this is false instead
         # of letting the user pick something the service cannot do.
         view["notify"] = {"available": notify_available(_token)}
+        # Whether a duration estimate can be offered per operation
+        # (the operator has set a measured effective duration). The
+        # UI hides the estimate area when false; an estimate call
+        # may still answer null for a concrete request when the
+        # lane state removes the basis.
+        view["estimate"] = {
+            "scan": active_estimate_policy.scan_seconds is not None,
+            "irradiation": (active_estimate_policy
+                            .irradiation_seconds_per_shot is not None)}
         return JSONResponse(view)
 
     async def targets_list(request):
@@ -346,6 +436,36 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         except KeyError:
             return JSONResponse({"error": "Target not found"}, status_code=404)
         return JSONResponse({"deleted": True, "target_id": target_id})
+
+    async def job_estimate(request):
+        """Pre-submission duration estimate for a confirmation
+        screen (foundation item 3): a range in seconds including
+        the queue wait, or estimate=null when the server has no
+        honest basis for one. Asking creates and reserves nothing;
+        the confirmation screens for irradiation also receive the
+        same estimate inline from prepare, so this endpoint mainly
+        serves the scan confirmation, which has no prepare step."""
+        if not enabled:
+            return denied()
+        owner, _token = await authenticate(request)
+        if owner is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        operation = request.query_params.get("operation")
+        if operation not in ("scan", "irradiation"):
+            return JSONResponse({"error": "invalid_operation"},
+                                status_code=400)
+        count = None
+        if operation == "irradiation":
+            raw_count = request.query_params.get("count")
+            try:
+                count = int(raw_count) if raw_count is not None else None
+            except ValueError:
+                count = None
+            if type(count) is not int or not 1 <= count <= MAX_SHOTS:
+                return JSONResponse({"error": "invalid_count"},
+                                    status_code=400)
+        estimate = await asyncio.to_thread(estimate_sync, operation, count)
+        return JSONResponse({"operation": operation, "estimate": estimate})
 
     async def jobs_scan(request):
         if not enabled:
@@ -463,9 +583,15 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             return JSONResponse({"error": "request_key already used"},
                                 status_code=409)
         completion = await asyncio.to_thread(completion_view, job["id"])
+        # The waiting screen's first paint: this job's own estimate
+        # from its actual place in the lane.
+        estimate = await asyncio.to_thread(
+            estimate_sync, "scan", None, before_job_id=job["id"],
+            owner=owner)
         return JSONResponse({"job_id": job["id"], "state": job["state"],
                              "operation": "scan", "cost": job["cost"],
-                             "completion": completion})
+                             "completion": completion,
+                             "estimate": estimate})
 
     async def jobs_irradiate_prepare(request):
         """S5's server side: validate the scan and park the shown
@@ -510,11 +636,17 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             ttl_seconds=CONFIRMATION_TTL_SECONDS)
         balance = await asyncio.to_thread(balance_view, owner)
         available = balance.get("available")
+        # The confirmation screen shows the duration estimate next
+        # to the quote: same validated count, same lane basis as
+        # the standalone estimate endpoint.
+        estimate = await asyncio.to_thread(
+            estimate_sync, "irradiation", count)
         return JSONResponse({"confirmation_id": confirmation_id,
                              "scan_id": scan_id, "quote": quote,
                              "available": available,
                              "balance_after": (available - quote["credits"]
                                                if type(available) is int else None),
+                             "estimate": estimate,
                              "expires_at": _iso(time.time() + CONFIRMATION_TTL_SECONDS)})
 
     async def jobs_irradiate(request):
@@ -550,10 +682,15 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
 
         async def job_response(job):
             completion = await asyncio.to_thread(completion_view, job["id"])
+            estimate = await asyncio.to_thread(
+                estimate_sync, "irradiation",
+                job["payload"].get("irradiation_count"),
+                before_job_id=job["id"], owner=owner)
             return JSONResponse({"job_id": job["id"], "state": job["state"],
                                  "operation": "irradiation", "cost": job["cost"],
                                  "quote": job["payload"].get("quote"),
-                                 "completion": completion})
+                                 "completion": completion,
+                                 "estimate": estimate})
 
         confirmation = await asyncio.to_thread(store.app_confirmation, owner,
                                                confirmation_id)
@@ -1013,6 +1150,58 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
         view = await asyncio.to_thread(job_view, owner, job_id)
         return JSONResponse(view)
 
+    async def job_viewed(request):
+        # The explicit "I saw the result" ack (batch 2d,
+        # MEDIUM 6). The status GET is side-effect free, so this
+        # POST is the only thing that records a view — and it
+        # records one only for a TERMINAL job: the view marker
+        # suppresses the completion mail outright, so recording
+        # it for an in-flight job (whose detail screen can be
+        # opened from history) would cancel a mail still owed.
+        # Idempotent: repeat acks answer the same.
+        if not enabled:
+            return denied()
+        owner, _token = await authenticate(request)
+        if owner is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        job_id = request.path_params["job_id"]
+        attributed = await asyncio.to_thread(store.app_job, job_id)
+        if attributed is None or attributed["si_owner"] != owner:
+            return JSONResponse({"error": "Job not found"}, status_code=404)
+        try:
+            job = await asyncio.to_thread(store.get, owner, job_id)
+            state = job["state"]
+        except KeyError:
+            return JSONResponse({"error": "Job not found"}, status_code=404)
+        except (ValueError, AttributeError, TypeError, RecursionError):
+            # Corrupt stored payload: the full read cannot decode
+            # it, but the view record does not depend on the
+            # payload — the columns carry the state without
+            # decoding (the same fallback the status read uses
+            # for its degraded view). A 500 here would strand the
+            # ack for a job whose result the owner did see
+            # (Antigravity glass audit, finding 4).
+            try:
+                columns = await asyncio.to_thread(
+                    store.job_columns, owner, job_id)
+            except KeyError:
+                return JSONResponse({"error": "Job not found"},
+                                    status_code=404)
+            state = columns["state"]
+        # 'unknown' is deliberately NOT an acknowledgeable
+        # outcome (round 2): the owner who opens an unknown job
+        # has seen uncertainty, not a result — the job may still
+        # be resolved, and the resolved outcome is owed its own
+        # notification. The poller's in-flight set agrees.
+        if state not in ("completed", "failed", "cancelled"):
+            completion = await asyncio.to_thread(completion_view, job_id)
+            return JSONResponse({"viewed": False,
+                                 "completion": completion})
+        await asyncio.to_thread(store.mark_result_viewed, owner, job_id)
+        completion = await asyncio.to_thread(completion_view, job_id)
+        return JSONResponse({"viewed": True,
+                             "completion": completion})
+
     async def history(request):
         if not enabled:
             return denied()
@@ -1136,6 +1325,7 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             Route("/api/app/targets", targets_register, methods=["POST"]),
             Route("/api/app/targets/rename", targets_rename, methods=["POST"]),
             Route("/api/app/targets/delete", targets_delete, methods=["POST"]),
+            Route("/api/app/estimate", job_estimate, methods=["GET"]),
             Route("/api/app/jobs/scan", jobs_scan, methods=["POST"]),
             Route("/api/app/jobs/irradiate/prepare", jobs_irradiate_prepare,
                   methods=["POST"]),
@@ -1146,5 +1336,6 @@ def app_routes(store, verifier, *, service, dplanet_client=None,
             Route("/api/app/readings/{reading_id}", reading_get, methods=["GET"]),
             Route("/api/app/jobs/{job_id}", job_status, methods=["GET"]),
             Route("/api/app/jobs/{job_id}/cancel", job_cancel, methods=["POST"]),
+            Route("/api/app/jobs/{job_id}/viewed", job_viewed, methods=["POST"]),
             Route("/api/app/resume", jobs_resume, methods=["POST"]),
             Route("/api/app/history", history, methods=["GET"])]
