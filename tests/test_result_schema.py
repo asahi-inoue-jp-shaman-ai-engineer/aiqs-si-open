@@ -286,10 +286,16 @@ class ResultSchemaTests(unittest.TestCase):
         view = public_job_view(self.store, self.store.get(self.owner, job["id"]))
         entries = view["result"]["scan"]["final_entries"]
         # The unhashable-id entry is dropped; the read is not poisoned.
-        self.assertEqual([e["entry_id"] for e in entries], ["one", "two"])
+        self.assertEqual({e["entry_id"] for e in entries}, {"one", "two"})
+        by_id = {e["entry_id"]: e for e in entries}
         # A digest-sized hits integer never publishes.
-        self.assertIsNone(entries[0]["hits"])
-        self.assertEqual(entries[1]["hits"], 5)
+        self.assertIsNone(by_id["one"]["hits"])
+        self.assertEqual(by_id["two"]["hits"], 5)
+        # A8 fix: publication order is hits descending, and an
+        # entry whose hits do not publish sorts below every entry
+        # with a known count (this assertion used to pin the old
+        # per-field rank order, ["one", "two"]).
+        self.assertEqual([e["entry_id"] for e in entries], ["two", "one"])
         self.assertIs(view["result"]["scan"]["observer_coordinate_applied"], False)
 
     def test_public_view_dedupes_entries_and_caps_rank(self):

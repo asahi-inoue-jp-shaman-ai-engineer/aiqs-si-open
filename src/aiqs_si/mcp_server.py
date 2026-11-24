@@ -294,7 +294,8 @@ def create_account_server(store, owner, *, embedded_test_worker=True, service=No
 
         When a scan completes, presenting the resonance ranking to the user
         is mandatory: show the top entries (field, content, hits) in
-        descending hit order; never finish with only a status or a count.
+        the ranking order returned — never re-sort them; never finish
+        with only a status or a count.
         After the ranking, always offer choices — three are mandatory:
         "Proceed to irradiation as-is", "Read the subconscious from the
         ranking", and "Acknowledge the ranking (stop here)"; add, when
@@ -339,8 +340,9 @@ def create_account_server(store, owner, *, embedded_test_worker=True, service=No
 
         When this returns a completed scan, presenting the resonance ranking
         to the user is mandatory: show the top entries (field, content,
-        hits) in descending hit order; never finish with only a status or a
-        count. After the ranking, always offer choices — three are
+        hits) in the ranking order returned — never re-sort them; never
+        finish with only a status or a count. After the ranking, always
+        offer choices — three are
         mandatory: "Proceed to irradiation as-is", "Read the subconscious
         from the ranking", and "Acknowledge the ranking (stop here)"; add,
         when fitting, choosing a shot count and irradiating, or changing the

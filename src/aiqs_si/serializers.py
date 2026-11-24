@@ -39,7 +39,7 @@ def _public_entries(store, payload, raw_entries):
                 for entry in entries:
                     if isinstance(entry, dict) and public_entry_id(entry.get("id")) is not None:
                         index[entry["id"]] = (field_name, entry.get("text"))
-    public = []
+    staged = []
     if isinstance(raw_entries, list):
         seen = set()
         for raw in raw_entries[:MAX_SCAN_ENTRIES]:
@@ -64,10 +64,42 @@ def _public_entries(store, payload, raw_entries):
                 # is dropped rather than serving worker-supplied text.
                 continue
             field_name, text = resolved
-            public.append({"entry_id": entry_id, "field_name": field_name,
-                           "text": text, "hits": public_count(raw.get("hits")),
-                           "rank": public_rank(raw.get("rank"))})
-    public.sort(key=lambda entry: (entry["rank"] is None, entry["rank"]))
+            # The stored QRS rides along for ORDERING ONLY (see the
+            # sort below); it is never copied into the published
+            # entry.
+            staged.append((_int_or_none(raw.get("qrs")),
+                           {"entry_id": entry_id, "field_name": field_name,
+                            "text": text, "hits": public_count(raw.get("hits")),
+                            "rank": public_rank(raw.get("rank"))}))
+    # Publication order is the ranking itself (owner spec,
+    # 2026-11-24, superseding the hits-only A8 order of the same
+    # day): QRS descending, ties broken by hits descending, then
+    # by the entry id alone (type-discriminated, so the integer 1
+    # and the string "1" — both valid ids — can never tie). The
+    # order is total and, over distinct entry ids, independent of
+    # the stored order within the first-100 projection above (the
+    # bounded prefix this serializer has always applied). The QRS
+    # value itself never publishes — the published fields and
+    # values are unchanged, including rank, which stays the
+    # per-field provenance the worker reported — but the relative
+    # QRS standing IS visible through the order: that visibility
+    # is the ranking's meaning, confirmed as spec by the owner.
+    # (An earlier draft held that order must not disclose QRS
+    # relations, Astra backfill + A8 review round 1 item 4; the
+    # owner's ruling replaces that premise.) A row whose QRS does
+    # not read as an integer — legacy rows predate the field, and
+    # malformed values are not schema-validated — sorts below
+    # every row with a known QRS; within that band, and within
+    # any one QRS band, an entry whose hits do not publish (None)
+    # sorts below every entry with a known count. Legacy results
+    # without QRS therefore publish in exactly the A8 hits order.
+    staged.sort(key=lambda item: (item[0] is None,
+                                  -(item[0] or 0),
+                                  item[1]["hits"] is None,
+                                  -(item[1]["hits"] or 0),
+                                  type(item[1]["entry_id"]).__name__,
+                                  str(item[1]["entry_id"])))
+    public = [entry for _, entry in staged]
     # Publication is bounded by the engine contract, and a rank is
     # only meaningful within the list actually published: a rank
     # beyond the published length (reachable when duplicate or

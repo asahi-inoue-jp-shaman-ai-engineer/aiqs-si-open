@@ -933,13 +933,57 @@ export function createFragmentSession({
   // the same derivation that validated the claim; otherwise
   // it is read once here, synchronously, in the same block
   // as the adoption.
-  const capture = handoff && handoff.identity !== undefined
+  // The baseline is a RATCHET (batch 2j; Astra batch2i diff
+  // review, F1): every state the fence accepts becomes the
+  // new baseline, so the comparisons below always run
+  // against the latest accepted state, never against the
+  // capture instant. The batch 2i fence compared against
+  // the capture forever: after accepting a legitimate
+  // rotation it went on testing states against the ORIGINAL
+  // revision, and a substitution under the rotated revision
+  // slipped past the same-revision token clause.
+  // `passedRevisions` remembers every revision the fence
+  // has moved past: a revision never serves again once
+  // ratcheted past, so a restored stale record cannot
+  // revive the token either. A revision change is accepted
+  // only as a forward step along the same lineage — the
+  // lineage check retires any sid change before this point.
+  // A revision-only transition of a record whose lineage
+  // is already established (the naming write's shape,
+  // batch 2g round 2) is accepted and ratcheted like a
+  // rotation — the record still holds the accepted token,
+  // so no foreign session is served. Legacy records on
+  // THIS surface are unaffected by the ratchet: without an
+  // epoch companion they never served here, and with one
+  // (whose binding tracks the epoch revision) the lineage
+  // check retires the token at naming — both exactly as
+  // before batch 2j (verified against the pre-change
+  // source by the batch 2j pinpoint review).
+  let capture = handoff && handoff.identity !== undefined
     ? handoff.identity
     : verifiedSharedIdentity(persistent);
-  const binding = handoff && handoff.lineage !== undefined
+  let binding = handoff && handoff.lineage !== undefined
     ? handoff.lineage
     : lineageOfIdentity(capture);
-  const current = () => {
+  const passedRevisions = new Set();
+  // Retirement LATCHES (batch 2j; Astra batch2i diff review,
+  // F2): once any fence check retires the token, this
+  // session never serves it again, whatever the shared
+  // state later becomes. The batch 2i fence judged each
+  // call statelessly, so when the state that had retired
+  // the token went away again — a foreign record removed,
+  // the captured record restored byte for byte — the
+  // account side revived the token, while the app side
+  // (which drops its in-memory session the moment
+  // supersession is detected) stayed retired: the two
+  // surfaces judged the same bytes inconsistently. The
+  // latch is the account side's mirror of the app side's
+  // dropInMemorySession — retirement is a property of this
+  // session, not of the instant's bytes. Successes never
+  // latch: an accepted rotation, an unchanged state, or a
+  // deployment with no persistent storage keep serving.
+  let retired = false;
+  const evaluate = () => {
     if (!token) return null;
     if (binding === undefined) return null;
     if (!persistent) return token;
@@ -973,19 +1017,40 @@ export function createFragmentSession({
         if (now.refreshToken !== null
             || now.rev !== capture.rev
             || now.sid !== capture.sid) return null;
-      } else if (now.rev === capture.rev
-          && now.refreshToken !== capture.refreshToken) {
-        // Same attested revision, different token (batch
-        // 2i): the record was replaced in place under a
-        // copied revision. A genuine rotation moves the
-        // revision together with the token in one commit
-        // and keeps the lineage, so it never trips this
-        // clause; the copied-revision substitution is
-        // exactly what does.
+      } else if (now.rev === capture.rev) {
+        // Same attested revision (batch 2i): the token must
+        // be the one the baseline holds. A different token
+        // under the same revision is a copied-revision
+        // substitution, never a rotation — a genuine
+        // rotation moves the revision together with the
+        // token in one commit and keeps the lineage.
+        if (now.refreshToken !== capture.refreshToken) return null;
+      } else if (passedRevisions.has(now.rev)) {
+        // A revision the fence already ratcheted past
+        // (batch 2j): a restored stale record never serves
+        // again, whatever token it carries.
         return null;
+      } else {
+        // A forward step along the same lineage: ratchet.
+        // The accepted state becomes the new baseline and
+        // the old revision joins the passed set.
+        passedRevisions.add(capture.rev);
+        capture = {
+          state: 'record',
+          refreshToken: now.refreshToken,
+          rev: now.rev,
+          sid: now.sid,
+        };
+        binding = nowLineage;
       }
     }
     return token;
+  };
+  const current = () => {
+    if (retired) return null;
+    const result = evaluate();
+    if (result === null) retired = true;
+    return result;
   };
   return Object.freeze({
     getToken: async () => current(),
