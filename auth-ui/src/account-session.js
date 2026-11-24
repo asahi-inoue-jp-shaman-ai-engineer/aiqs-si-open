@@ -388,19 +388,83 @@ const SHARED_EPOCH_KEY = 'si-app-session-epoch-v1';
 // pre-2f fallback and swept on every write.
 const CARRY_KEY = 'si-fragment-handoff-carry-v1';
 
-// The shared state as ONE carry binding: the lineage when the
-// record carries one, else its revision (legacy records and
-// tombstones without a lineage), else 'none' when no shared
-// record exists. null when there is no persistent storage at
-// all — no shared state exists that could move, so no binding
-// is needed (or possible).
-export function sharedCarryBinding(persistentStorage) {
+// The shared session as ONE verified snapshot (batch 2g, R1):
+// the projection of the verified derivation that the APP
+// (app-auth.js) loads and fences by — token, revision and
+// lineage read from the same records under the same shape
+// rules as verifiedSharedCarryBinding, so the app surface and
+// the account surface can never classify the same stored
+// bytes differently. The app used to parse the records
+// itself, leniently (the derivation removed below in this
+// batch did the same on this side): a stored 'null' literal
+// or '{}' collapsed into absence, and a session record
+// carrying a lineage but no revision inherited the epoch
+// record's revision — so a foreign (or corrupted) session
+// record left the app's retained fragment token dispatchable
+// under the clear tombstone its adoption had written (Astra
+// batch2f diff review, R1 app-side variant).
+//
+// Returns null when there is no persistent storage at all.
+// Otherwise one of:
+// - { state: 'absent' } — confirmed: neither key holds a
+//   record.
+// - { state: 'unverifiable' } — a present record cannot be
+//   read back, or its shape is one the protocol never writes.
+// - { state: 'record', refreshToken, rev, sid } — the session
+//   record's token (null when only a clear tombstone exists),
+//   the revision the state attests, and its lineage. A session
+//   record carrying a lineage reports that lineage and its
+//   OWN revision (never the epoch's); the epoch record
+//   supplies the revision only for a legacy session record
+//   carrying neither field — the same deferral as the
+//   verified binding. One deliberate projection difference:
+//   such a legacy record whose epoch companion is ABSENT
+//   still reports here, with rev and sid null (the verified
+//   binding names no binding for it): the app holds that very
+//   token, binds to the unnamed state, and any later write
+//   moves the snapshot away from the binding; the first
+//   successful refresh re-persists the record in the atomic
+//   shape, after which disappearance and corruption
+//   invalidate like any established record.
+export function verifiedSharedSessionSnapshot(persistentStorage) {
   if (!persistentStorage) return null;
-  const lineage = readSharedLineage(persistentStorage);
-  if (!lineage) return 'none';
-  if (lineage.sid) return { sid: lineage.sid };
-  if (lineage.rev) return { rev: lineage.rev };
-  return 'none';
+  const session = readSharedRecord(persistentStorage, SHARED_SESSION_KEY);
+  if (session.state === 'unreadable') return { state: 'unverifiable' };
+  if (session.state === 'record') {
+    const binding = sessionRecordBinding(session.record);
+    if (binding === null) return { state: 'unverifiable' };
+    if (binding === 'epoch') {
+      const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
+      if (epoch.state === 'unreadable') return { state: 'unverifiable' };
+      if (epoch.state === 'absent') {
+        return {
+          state: 'record', refreshToken: session.record.refreshToken,
+          rev: null, sid: null,
+        };
+      }
+      const rev = epochRecordRevision(epoch.record);
+      if (rev === null) return { state: 'unverifiable' };
+      return {
+        state: 'record', refreshToken: session.record.refreshToken,
+        rev, sid: null,
+      };
+    }
+    return {
+      state: 'record',
+      refreshToken: session.record.refreshToken,
+      rev: isNonEmptyString(session.record.rev) ? session.record.rev : null,
+      sid: binding.sid ?? null,
+    };
+  }
+  const epoch = readSharedRecord(persistentStorage, SHARED_EPOCH_KEY);
+  if (epoch.state === 'unreadable') return { state: 'unverifiable' };
+  if (epoch.state === 'absent') return { state: 'absent' };
+  const rev = epochRecordRevision(epoch.record);
+  if (rev === null) return { state: 'unverifiable' };
+  return {
+    state: 'record', refreshToken: null, rev,
+    sid: isNonEmptyString(epoch.record.sid) ? epoch.record.sid : null,
+  };
 }
 
 // Read one shared-state key in three states (batch 2f):
@@ -503,8 +567,10 @@ function epochRecordRevision(record) {
 }
 
 // The current shared binding, VERIFIED (batch 2e round 4, R1;
-// shapes hardened in batch 2f): the same derivation as
-// sharedCarryBinding, but a state that cannot be read back —
+// shapes hardened in batch 2f): the one derivation of the
+// shared state — every surface reads it here or through its
+// projections (batch 2g removed the lenient twin) — and a
+// state that cannot be read back —
 // a throwing read, an unparseable value, or a present record
 // whose shape the protocol never writes ({} / [] / a session
 // record with no usable refresh token) — yields null
@@ -617,42 +683,17 @@ function defaultPersistentStorage() {
   try { return globalThis.localStorage ?? null; } catch { return null; }
 }
 
-function lineageFromRecords(session, epoch) {
-  const revOf = (record) => {
-    if (!record) return null;
-    if (typeof record.rev === 'string' && record.rev) return record.rev;
-    if (typeof record.epoch === 'number') return `legacy:${record.epoch}`;
-    return null;
-  };
-  if (session && typeof session.refreshToken === 'string' && session.refreshToken) {
-    return { rev: revOf(session) ?? revOf(epoch), sid: session.sid ?? null };
-  }
-  if (epoch) return { rev: revOf(epoch), sid: epoch.sid ?? null };
-  return null;
-}
-
-function readSharedLineage(persistentStorage) {
-  if (!persistentStorage) return null;
-  const parse = (key) => {
-    try {
-      const saved = JSON.parse(persistentStorage.getItem(key) || 'null');
-      return saved && typeof saved === 'object' ? saved : null;
-    } catch { return null; }
-  };
-  return lineageFromRecords(parse(SHARED_SESSION_KEY), parse(SHARED_EPOCH_KEY));
-}
-
 // The lineage read WITH its readability (batch 2f round 3;
 // derivation unified onto the verified binding in the batch
-// 2f additional round): readSharedLineage collapses a
-// throwing read and an unparseable present value into the
-// same null as confirmed absence, which let an adopted
-// 'none' carry keep serving its token while the shared state
-// could not be read at all — the fence must treat unreadable
-// as unverifiable and retire, exactly as adoption does.
-// Round 3's tri-state reader still parsed the records
-// ITSELF, and its shape interpretation disagreed with the
-// verified derivation twice: a stored JSON 'null' literal
+// 2f additional round): the lenient reader this replaced
+// collapsed a throwing read and an unparseable present value
+// into the same null as confirmed absence, which let an
+// adopted 'none' carry keep serving its token while the
+// shared state could not be read at all — the fence must
+// treat unreadable as unverifiable and retire, exactly as
+// adoption does. Round 3's tri-state reader still parsed the
+// records ITSELF, and its shape interpretation disagreed with
+// the verified derivation twice: a stored JSON 'null' literal
 // read as confirmed absence here but as unreadable in
 // readSharedRecord, and a bare {"refreshToken": ...} record
 // read as the empty lineage {rev: null, sid: null} here but
@@ -665,7 +706,10 @@ function readSharedLineage(persistentStorage) {
 // no fence-side parsing, no second classification. A state
 // the verified derivation cannot classify is 'unreadable'
 // here too. No storage at all is a deployment shape, not a
-// failure: lineage null, state ok.
+// failure: lineage null, state ok. (Batch 2g removed the
+// lenient reader and its last caller outright: no surface
+// may derive shared state except through the verified
+// derivation and its projections.)
 function readSharedLineageState(persistentStorage) {
   if (!persistentStorage) return { state: 'ok', lineage: null };
   const binding = verifiedSharedCarryBinding(persistentStorage);

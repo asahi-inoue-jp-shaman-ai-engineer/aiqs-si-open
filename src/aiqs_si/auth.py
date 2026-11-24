@@ -8,7 +8,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from .mcp_server import create_account_server
 from .deployment import production_environment, store_in_production
 from .notifications import plausible_email
-from .policies import enforce_policy_posture
+from .policies import enforce_policy_coherence, enforce_policy_posture
 from mcp.server.transport_security import TransportSecuritySettings
 
 SCOPE = "aiqs:use"
@@ -152,6 +152,14 @@ def create_http_server(store, verifier, *, service=None, embedded_test_worker=No
         # store's own durable designation is a production signal
         # here too (Antigravity glass audit, finding 7).
         enforce_policy_posture()
+        # Policy coherence at this boundary too (batch 2g, R4):
+        # posture validates the env, but the policies in effect
+        # can still be stale snapshots — pricing froze at import
+        # time, the store's grant/limit froze at construction.
+        # create_application has compared them since batch 2e;
+        # this direct constructor must not run production on the
+        # stale values either (Astra batch2f diff review, R4).
+        enforce_policy_coherence(store)
     def current_owner():
         token = get_access_token()
         if not isinstance(token, UserAccessToken):

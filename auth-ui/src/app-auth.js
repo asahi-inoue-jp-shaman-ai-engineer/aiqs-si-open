@@ -67,6 +67,23 @@
 // account pages bind to the lineage, so a same-account
 // rotation never retires them but any replacement does.
 //
+// Batch 2g (Astra batch2f diff review, R1 app-side variant):
+// the account pages' fence was unified onto the verified
+// derivation in batch 2f, but THIS module still parsed the
+// shared records itself, leniently — a stored 'null' literal
+// or '{}' collapsed into "no record", and a session record
+// carrying a lineage but no revision inherited the epoch
+// record's revision — so a foreign (or corrupted) session
+// record left a fragment token dispatchable under the clear
+// tombstone its adoption had written, in the very cases the
+// verified derivation refuses. The shared state is now read
+// ONLY through verifiedSharedSessionSnapshot
+// (account-session.js): one derivation, strictly shaped, for
+// both surfaces. A present record the protocol never writes
+// is unverifiable — never absence — and the supersession
+// fence compares BOTH halves of the binding (revision and
+// lineage), so a record cannot borrow another record's half.
+//
 // Round 2 of the same review closed three more sequences:
 // - The token request's fence compares against the revision
 //   the SENT token is bound to (passed in from the caller's
@@ -81,7 +98,9 @@
 //   same-owner exemption: an older tombstone of this very
 //   instance must not stand in for a session record that has
 //   since disappeared.
-import { ensureFragmentHandoff, takeFragmentToken } from './account-session.js';
+import {
+  ensureFragmentHandoff, takeFragmentToken, verifiedSharedSessionSnapshot,
+} from './account-session.js';
 
 const CLIENT_ID = 'si-app';
 const PENDING_KEY = 'si-app-pkce-v1';
@@ -139,72 +158,85 @@ export function createAppAuth({
     return base64url(crypto.getRandomValues(new Uint8Array(16)));
   }
 
-  // The persisted session record (SESSION_KEY): one JSON value
-  // holding the refresh token together with the revision and
-  // lineage it is bound to. Records written before batch 2e
-  // hold only {refreshToken, savedAt}; their revision lives in
-  // the epoch record, which readSharedSession falls back to —
-  // and the first persist from this code rewrites the record
-  // in the atomic shape.
-  function readSessionRecord() {
-    if (!persistentStorage) return null;
-    try {
-      const saved = JSON.parse(persistentStorage.getItem(SESSION_KEY) || 'null');
-      if (saved && typeof saved === 'object'
-          && typeof saved.refreshToken === 'string' && saved.refreshToken) {
-        return {
-          refreshToken: saved.refreshToken,
-          rev: typeof saved.rev === 'string' && saved.rev ? saved.rev : null,
-          owner: saved.owner, sid: saved.sid ?? null,
-        };
-      }
-    } catch { /* corrupted entry: treated as no record */ }
-    return null;
-  }
-
-  // The epoch record (EPOCH_KEY): since batch 2e it is written
-  // only as a CLEAR tombstone — a clear has no token, so its
-  // revision cannot ride inside a session record — and read as
-  // the revision source for legacy session records.
-  function readEpochRecord() {
-    if (!persistentStorage) return null;
-    try {
-      const saved = JSON.parse(persistentStorage.getItem(EPOCH_KEY) || 'null');
-      if (saved && typeof saved === 'object') {
-        if (typeof saved.rev === 'string' && saved.rev) {
-          return { rev: saved.rev, owner: saved.owner, sid: saved.sid ?? null };
-        }
-        // Legacy numeric-epoch records (round 1) still fence by
-        // equality: their value becomes the revision string.
-        if (typeof saved.epoch === 'number') {
-          return { rev: `legacy:${saved.epoch}`, owner: saved.owner, sid: null };
-        }
-      }
-    } catch { /* corrupted entry: treated as no record */ }
-    return null;
+  // The shared session, read ONLY through the verified
+  // derivation (batch 2g, R1): verifiedSharedSessionSnapshot
+  // (account-session.js) reads the persisted session record
+  // (SESSION_KEY) and the epoch record (EPOCH_KEY) under the
+  // same strict shape rules the account pages validate a
+  // carry against, so the two surfaces can never classify the
+  // same stored bytes differently. The persisted session
+  // record is one JSON value holding the refresh token
+  // together with the revision and lineage it is bound to;
+  // records written before batch 2e hold only {refreshToken,
+  // savedAt} and defer their revision to the epoch record —
+  // the snapshot applies exactly that deferral, and no other:
+  // a record carrying a lineage reports its OWN revision,
+  // never the epoch's. A present record the protocol never
+  // writes (a stored 'null' literal, '{}', a mistyped field)
+  // is UNVERIFIABLE here — not absence.
+  function sharedSnapshot() {
+    if (!persistentStorage) return { state: 'absent' };
+    return verifiedSharedSessionSnapshot(persistentStorage);
   }
 
   // One consistent snapshot of the shared session: token,
-  // revision and lineage from the SAME record. The session
-  // record's own revision wins; the epoch record supplies the
-  // revision only for a legacy session record (or the binding
-  // of a clear tombstone when no session exists).
+  // revision and lineage from the SAME record. Null when no
+  // valid session record exists — confirmed absence,
+  // tombstone-only, or unverifiable (a loader simply has
+  // nothing it may use; the fence distinguishes the three).
   function readSharedSession() {
-    const session = readSessionRecord();
-    if (session) {
-      if (session.rev) return session;
-      const epoch = readEpochRecord();
-      return { ...session, rev: epoch ? epoch.rev : null };
-    }
-    return null;
+    const snap = sharedSnapshot();
+    if (snap.state !== 'record' || !snap.refreshToken) return null;
+    return { refreshToken: snap.refreshToken, rev: snap.rev, sid: snap.sid };
   }
 
-  function sharedRevision() {
-    const session = readSessionRecord();
-    if (session?.rev) return session.rev;
-    const epoch = readEpochRecord();
-    if (epoch) return epoch.rev;
-    return null;
+  // The identity the token-request fence compares against
+  // (batch 2g round 2, R1): the WHOLE snapshot — state,
+  // revision, lineage AND the refresh token itself — not the
+  // revision alone. The revision-only fence was blind to
+  // replacements that keep the revision: an unnamed (legacy)
+  // record has revision null, and a foreign record carrying a
+  // lineage but no revision of its own also reports null, so
+  // a response for the old session committed OVER the
+  // replacement. An unverifiable state is fingerprinted by
+  // the raw stored bytes (read for comparison only, never
+  // parsed): a request that started against those exact bytes
+  // may still land its own commit over them — a fresh code
+  // exchange healing a corrupt record — while ANY change to
+  // the bytes, to a record, or to absence fails the fence.
+  let unverifiableReadCounter = 0;
+  function rawStoredValue(key) {
+    try { return persistentStorage.getItem(key); }
+    catch { return undefined; }
+  }
+  function snapshotIdentity(snap) {
+    if (snap.state === 'record') {
+      return JSON.stringify(['record', snap.rev, snap.sid, snap.refreshToken]);
+    }
+    if (snap.state === 'absent') return '["absent"]';
+    const rawSession = rawStoredValue(SESSION_KEY);
+    const rawEpoch = rawStoredValue(EPOCH_KEY);
+    if (rawSession === undefined || rawEpoch === undefined) {
+      // The store cannot even be read back: no two reads may
+      // be presumed equal, so this identity matches nothing,
+      // not even itself.
+      unverifiableReadCounter += 1;
+      return JSON.stringify(['unreadable', unverifiableReadCounter]);
+    }
+    return JSON.stringify(['unverifiable',
+      rawSession === null ? null : String(rawSession),
+      rawEpoch === null ? null : String(rawEpoch)]);
+  }
+  function sharedIdentity() {
+    return snapshotIdentity(sharedSnapshot());
+  }
+  // The identity of the record THIS instance's in-memory
+  // session claims: its binding and its refresh token, in the
+  // same shape snapshotIdentity reports for a record. A
+  // request sent under it may commit only while the shared
+  // record still IS that identity.
+  function boundIdentity() {
+    return JSON.stringify(['record', boundRevision, boundSid, refreshToken]);
   }
 
   // THE commit (batch 2e, R1): token, revision and lineage in
@@ -240,10 +272,11 @@ export function createAppAuth({
   // Tri-state probe of the session record (batch 2e round 3,
   // R1 HIGH-2): 'present' (anything stored, parseable or not),
   // 'absent' (confirmed: the read returned null), 'unreadable'
-  // (the read threw). readSessionRecord collapses the last two
-  // into null, which is fine for supersession checks but NOT
-  // for adoption: an unreadable record may still be there,
-  // speaking for the old account in every other tab.
+  // (the read threw). The snapshot derivation collapses the
+  // last two into "no usable record", which is fine for
+  // loading but NOT for adoption: an unreadable record may
+  // still be there, speaking for the old account in every
+  // other tab.
   function probeSessionRecord() {
     if (!persistentStorage) return 'absent';
     let raw;
@@ -306,27 +339,50 @@ export function createAppAuth({
 
   // Whether the shared session has rotated, replaced, or
   // cleared the session this instance's in-memory session
-  // belongs to. The test is an EXACT revision match against
-  // this instance's binding (batch 2e round 2, R1): there is
-  // no same-owner exemption — an older tombstone written by
-  // THIS instance (a clear that predates the current session)
-  // must not stand in for a session record that has since
-  // disappeared. My own writes never count as supersession
-  // because each one moves the binding to its own revision in
-  // the same synchronous step (persistRefreshToken /
-  // clearPersistedSession). Sessions without a refresh token —
-  // fragment handoffs — are covered through their bound
-  // revision: their adoption wrote the tombstone, and any
-  // later write moves past it. A record that existed for this
-  // binding and is now missing or unreadable counts as
-  // supersession (batch 2e, R1): disappearance is invalidation,
-  // never silent currency.
+  // belongs to. The test is an EXACT match on BOTH halves of
+  // this instance's binding — revision and lineage — against
+  // the verified snapshot (batch 2e round 2, R1; batch 2g):
+  // there is no same-owner exemption — an older tombstone
+  // written by THIS instance (a clear that predates the
+  // current session) must not stand in for a session record
+  // that has since disappeared. My own writes never count as
+  // supersession because each one moves the binding to its
+  // own revision and lineage in the same synchronous step
+  // (persistRefreshToken / clearPersistedSession). Sessions
+  // without a refresh token — fragment handoffs — are covered
+  // through their binding: their adoption wrote the tombstone,
+  // and any later write moves past it. The lineage half is
+  // what the revision-only test missed (batch 2g): a foreign
+  // session record carrying a lineage but no revision of its
+  // own borrowed the tombstone's revision and passed — the
+  // pair cannot be borrowed, because the snapshot reports a
+  // record's lineage only from that record itself. A state
+  // that is present but UNVERIFIABLE is supersession outright
+  // (batch 2g, R1): retained credentials are never served
+  // under a state that cannot be read back. A record that
+  // existed for this binding and is now missing counts as
+  // supersession too (batch 2e, R1): disappearance is
+  // invalidation, never silent currency — an unbound session
+  // (an access-token-only adoption that never touched the
+  // shared record) has no established record to lose.
   function sharedSessionSuperseded() {
     if (!persistentStorage) return false;
     if (!accessToken && !refreshToken) return false;
-    const rev = sharedRevision();
-    if (rev === null) return boundRevision !== null;
-    return rev !== boundRevision;
+    const snap = sharedSnapshot();
+    if (snap.state === 'unverifiable') return true;
+    if (snap.state === 'absent') {
+      return boundRevision !== null || boundSid !== null;
+    }
+    // The token itself is part of the comparison (batch 2g
+    // round 2): two UNNAMED records share the (null, null)
+    // binding, so binding alone cannot tell this instance's
+    // legacy session from a foreign legacy record that
+    // replaced it — the token value can, and this instance
+    // holds it. For named records the clause never fires on
+    // protocol writes (token and revision move together in
+    // one commit); it fires exactly on foreign replacement.
+    return snap.rev !== boundRevision || snap.sid !== boundSid
+      || (refreshToken !== null && snap.refreshToken !== refreshToken);
   }
 
   function dropInMemorySession() {
@@ -357,6 +413,34 @@ export function createAppAuth({
         return false;
       }
       refreshToken = data.refresh_token;
+    } else if (lineage === 'new') {
+      // An access-only response to a FRESH authorization
+      // (batch 2g round 2, R1): the access token belongs to
+      // the new authorization, but without its refresh token
+      // there is no new lineage to bind it to — pairing it
+      // with the RETAINED session's refresh token and binding
+      // would serve the new account's token under the old
+      // account's lineage. Refuse the adoption outright; the
+      // caller reports failure and the old session (if any)
+      // stands untouched.
+      return false;
+    } else if (persistentStorage && refreshToken) {
+      // Access-only ROTATION (lineage 'same'): the access
+      // token was minted by the refresh token that was sent,
+      // so the pairing is sound — but when the shared record
+      // is still an UNNAMED legacy record holding exactly
+      // that token, name it now (batch 2g round 2): persist
+      // the same token in the atomic shape, giving the
+      // session the revision and lineage every fence compares.
+      // Leaving it unnamed would keep two different legacy
+      // sessions indistinguishable to the binding checks. A
+      // failed naming commit aborts the adoption like any
+      // other failed commit.
+      const snap = sharedSnapshot();
+      if (snap.state === 'record' && snap.rev === null && snap.sid === null
+        && snap.refreshToken === refreshToken) {
+        if (!persistRefreshToken(refreshToken, freshRevision())) return false;
+      }
     }
     accessToken = data.access_token;
     const lifetime = typeof data.expires_in === 'number'
@@ -368,30 +452,41 @@ export function createAppAuth({
   // 'ok' | 'rejected' | 'error' | 'superseded' — a rejection
   // means the server refused the grant (e.g. an expired/revoked
   // refresh token); an error means the exchange never completed
-  // (network/parse); 'superseded' means the shared-revision
+  // (network/parse); 'superseded' means the shared-state
   // fence discarded the response because another tab moved the
   // shared session while the request was in flight.
-  async function tokenRequest(params, { lineage = 'new', expectedRevision } = {}) {
+  async function tokenRequest(params, { lineage = 'new', expectedIdentity } = {}) {
     const requestedGeneration = generation;
-    // The shared-revision fence (batch 2d, HIGH 1): if any tab
-    // persisted or cleared the shared session while this request
-    // was in flight, the response belongs to a superseded
-    // session and is discarded WITHOUT adopting — above all
-    // without re-persisting its refresh token over the newer
-    // tab's session. The expected revision is the one the SENT
-    // credentials are bound to, supplied by the caller from its
-    // snapshot (batch 2e round 2, R1): re-reading the current
-    // revision here instead would let a commit that landed
-    // between the caller's load and this request pair the OLD
-    // token with the NEW session's revision — both checks would
-    // pass against the new revision and the old session's
-    // rotation would overwrite the new one. The final check and
-    // adopt()'s persist run in one synchronous block after the
-    // last await, so a foreign commit lands either before the
-    // check (detected) or after the persist (its write wins and
-    // this instance's binding then mismatches — supersession,
-    // the correct outcome).
-    const requestedRevision = expectedRevision;
+    // The shared-state fence (batch 2d, HIGH 1; batch 2g
+    // round 2): if any tab persisted or cleared the shared
+    // session while this request was in flight, the response
+    // belongs to a superseded session and is discarded WITHOUT
+    // adopting — above all without re-persisting its refresh
+    // token over the newer tab's session. The expected identity
+    // is the one the SENT credentials are bound to, supplied by
+    // the caller from its snapshot (batch 2e round 2, R1):
+    // re-reading the current state here instead would let a
+    // commit that landed between the caller's load and this
+    // request pair the OLD token with the NEW session's
+    // identity — both checks would pass against the new state
+    // and the old session's rotation would overwrite the new
+    // one. The comparison covers the whole snapshot identity
+    // (state, revision, lineage, token), not the revision
+    // alone: replacements that keep the revision — an unnamed
+    // legacy record swapped for another, a foreign record
+    // borrowing the tombstone's null revision — move the
+    // identity and are discarded. The final check and adopt()'s
+    // persist run in one synchronous block after the last
+    // await, so a foreign commit lands either before the check
+    // (detected) or after the persist (its write wins and this
+    // instance's binding then mismatches — supersession, the
+    // correct outcome).
+    const requestedIdentity = expectedIdentity;
+    // Without persistent storage the session is memory-only
+    // by design: there is no shared state another tab could
+    // move, so the fence trivially holds.
+    const fenceHolds = () => !persistentStorage
+      || sharedIdentity() === requestedIdentity;
     let response;
     try {
       response = await fetch(tokenUrl, {
@@ -402,12 +497,12 @@ export function createAppAuth({
       });
     } catch { return 'error'; }
     if (requestedGeneration !== generation) return 'error';
-    if (sharedRevision() !== requestedRevision) return 'superseded';
+    if (!fenceHolds()) return 'superseded';
     if (!response.ok) return 'rejected';
     let data = null;
     try { data = await response.json(); } catch { data = null; }
     if (requestedGeneration !== generation) return 'error';
-    if (sharedRevision() !== requestedRevision) return 'superseded';
+    if (!fenceHolds()) return 'superseded';
     return adopt(data, { lineage }) ? 'ok' : 'error';
   }
 
@@ -427,7 +522,7 @@ export function createAppAuth({
     const outcome = await tokenRequest({
       grant_type: 'authorization_code', client_id: CLIENT_ID, code,
       redirect_uri: redirectUri, code_verifier: pending.verifier,
-    }, { expectedRevision: sharedRevision() });
+    }, { expectedIdentity: sharedIdentity() });
     return outcome === 'ok' && requestedGeneration === generation;
   }
 
@@ -477,14 +572,14 @@ export function createAppAuth({
     let sentToken = refreshToken;
     let outcome = await tokenRequest({
       grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token: sentToken,
-    }, { lineage: 'same', expectedRevision: boundRevision });
+    }, { lineage: 'same', expectedIdentity: boundIdentity() });
     // The session may have been replaced while the request was in
     // flight (fragment handoff, sign-out): the outcome then belongs
     // to the previous account and must not mutate the new session —
     // in particular a stale 'rejected' must not clear it.
     if (requestedGeneration !== generation) return null;
     if (outcome === 'error' || outcome === 'superseded') {
-      // A discard by the shared-revision fence most often means
+      // A discard by the shared-state fence most often means
       // another tab rotated the shared session first: its newer
       // persisted token is the live one, so retry once with it
       // instead of reporting a spurious sign-out. A cleared
@@ -512,7 +607,7 @@ export function createAppAuth({
         outcome = await tokenRequest({
           grant_type: 'refresh_token', client_id: CLIENT_ID,
           refresh_token: persisted,
-        }, { lineage: 'same', expectedRevision: boundRevision });
+        }, { lineage: 'same', expectedIdentity: boundIdentity() });
         if (requestedGeneration !== generation) return null;
       } else if (outcome === 'superseded') {
         dropInMemorySession();

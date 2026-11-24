@@ -8,7 +8,7 @@ from starlette.middleware import Middleware
 from .request_limits import RequestBodyLimit, worker_boundary_key_from_env
 from .auth import create_http_server
 from .deployment import production_environment, store_in_production
-from .policies import enforce_policy_posture
+from .policies import enforce_policy_coherence, enforce_policy_posture
 from .worker_api import create_worker_app
 from starlette.datastructures import MutableHeaders
 
@@ -39,33 +39,6 @@ class _OnboardingNoStore:
                 headers['Pragma'] = 'no-cache'
             await send(message)
         await self.app(scope, receive, no_store)
-
-
-def _enforce_policy_coherence(store):
-    """The policies IN EFFECT must be the policies the deployment
-    environment NOW describes (batch 2e, R4). Two snapshots can
-    silently diverge from a fresh env load: the pricing module
-    froze its policy at import time, and the store froze its
-    grant/limit policies at construction. A host that imports or
-    constructs before the service env is fully applied would
-    then run production on stale money/exposure values while the
-    env — and the posture check — say otherwise. Field-wise
-    comparison against fresh loads; any divergence refuses the
-    composition. Policy values themselves are never reported."""
-    from . import pricing
-    from .policies import (load_grant_policy, load_limit_policy,
-                           load_pricing_policy)
-    held_pairs = (
-        ("pricing", pricing._POLICY, load_pricing_policy()),
-        ("grant", store.grant_policy, load_grant_policy()),
-        ("limit", store.limit_policy, load_limit_policy()),
-    )
-    for name, held, fresh in held_pairs:
-        if vars(held) != vars(fresh):
-            raise ValueError(
-                f"the {name} policy in effect diverges from the "
-                "deployment environment; refusing to start a "
-                "production composition on stale policy values")
 
 
 def create_application(store, user_verifier, worker_verifier, *, allowed_workers, service=None, billing=None, ui_directory=None,
@@ -100,7 +73,7 @@ def create_application(store, user_verifier, worker_verifier, *, allowed_workers
             raise ValueError(
                 "AIQS_SI_WORKER_BOUNDARY_KEY must be configured for a "
                 "production worker composition")
-        _enforce_policy_coherence(store)
+        enforce_policy_coherence(store)
     if billing is not None and billing.store is not store:
         raise ValueError('Billing and account store must match')
     onboarding = None

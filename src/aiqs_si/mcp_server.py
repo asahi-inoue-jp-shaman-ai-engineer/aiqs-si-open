@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import os
 from .deployment import store_in_production
-from .policies import enforce_policy_posture
+from .policies import enforce_policy_coherence, enforce_policy_posture
 from .service import Service
 from .maintenance import Maintenance
 from .worker import Worker
@@ -52,6 +52,14 @@ def create_account_server(store, owner, *, embedded_test_worker=True, service=No
         # policies. First in the body: the default Service
         # construction below must never run ahead of the gate.
         enforce_policy_posture()
+        # Policy coherence at this boundary too (batch 2g, R4):
+        # posture validates the env, but the policies in effect
+        # can still be stale snapshots — pricing froze at import
+        # time, the store's grant/limit froze at construction.
+        # create_application has compared them since batch 2e;
+        # this direct constructor must not run production on the
+        # stale values either (Astra batch2f diff review, R4).
+        enforce_policy_coherence(store)
     if not callable(owner):
         store.balance(owner)
     def current_owner():

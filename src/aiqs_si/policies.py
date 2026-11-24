@@ -548,6 +548,40 @@ def enforce_policy_posture(environ=None):
             "Operator policy posture incomplete: " + "; ".join(problems))
 
 
+def enforce_policy_coherence(store, environ=None):
+    """The policies IN EFFECT must be the policies the deployment
+    environment NOW describes (batch 2e, R4; extended to every
+    production constructor in batch 2g). Two snapshots can
+    silently diverge from a fresh env load: the pricing module
+    froze its policy at import time, and the store froze its
+    grant/limit policies at construction. A host that imports or
+    constructs before the service env is fully applied would
+    then run production on stale money/exposure values while the
+    env — and the posture check — say otherwise. Field-wise
+    comparison against fresh loads; any divergence refuses the
+    composition. Policy values themselves are never reported.
+
+    Batch 2e ran this only in create_application; the direct
+    constructors (auth.create_http_server, mcp_server's
+    create_account_server) called posture alone, so the
+    counterexample — import pricing under one env, then supply
+    complete valid policies and construct the MCP server
+    directly — kept the stale import-time rates (Astra batch2f
+    diff review, R4). Every production gate now runs both."""
+    from . import pricing
+    held_pairs = (
+        ("pricing", pricing._POLICY, load_pricing_policy(environ)),
+        ("grant", store.grant_policy, load_grant_policy(environ)),
+        ("limit", store.limit_policy, load_limit_policy(environ)),
+    )
+    for name, held, fresh in held_pairs:
+        if vars(held) != vars(fresh):
+            raise ValueError(
+                f"the {name} policy in effect diverges from the "
+                "deployment environment; refusing to start a "
+                "production composition on stale policy values")
+
+
 _PROFILE_KEYS = {"cycles", "top_mfs", "top_entries", "qrs_threshold",
                  "duration_sec", "count"}
 
